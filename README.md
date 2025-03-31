@@ -1,4 +1,4 @@
-# Prototypical Networks for Few-shot Learning
+# Prototypical Networks for Few-shot Learning Mason and Josh PCSE 555
 
 Code for the NIPS 2017 paper [Prototypical Networks for Few-shot Learning](http://papers.nips.cc/paper/6996-prototypical-networks-for-few-shot-learning.pdf).
 
