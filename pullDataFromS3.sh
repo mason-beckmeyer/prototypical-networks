@@ -17,14 +17,20 @@ download() {
     local local_dir=$1     # e.g., data/train/
     local s3_folder=$2     # e.g., train/
 
-    mkdir -p "$local_dir"
+    mkdir -p "$local_dir/gt_post"
+    mkdir -p "$local_dir/img_post"
 
     echo "Downloading $COUNT images from s3://$BUCKET/$s3_folder to $local_dir"
 
     aws s3 ls "s3://$BUCKET/$s3_folder/gt_post/" | head -n "$COUNT" | awk '{print $4}' | while read -r file; do
         if [ -n "$file" ]; then
             echo " -> Downloading: $file"
-            aws s3 cp "s3://$BUCKET/$s3_folder/gt_post/$file" "$local_dir"
+
+            base_file="${file/_target/}"
+
+
+            aws s3 cp "s3://$BUCKET/$s3_folder/gt_post/$file" "$local_dir/gt_post/"
+            aws s3 cp "s3://$BUCKET/$s3_folder/img_post/$base_file" "$local_dir/img_post/"
         fi
     done
 }
