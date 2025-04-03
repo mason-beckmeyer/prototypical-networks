@@ -7,7 +7,7 @@ from protonets.utils.log import load_trace
 
 def main(opt):
     result_dir = os.path.dirname(opt['model.model_path'])
-
+    result_dir = "../../../results/"
     # get target training loss to exceed
     trace_file = os.path.join(result_dir, 'trace.txt')
     trace_vals = load_trace(trace_file)
@@ -15,6 +15,7 @@ def main(opt):
 
     # load opts
     model_opt_file = os.path.join(os.path.dirname(opt['model.model_path']), 'opt.json')
+    model_opt_file = os.path.join(result_dir, 'opt.json')
     with open(model_opt_file, 'r') as f:
         model_opt = json.load(f)
 

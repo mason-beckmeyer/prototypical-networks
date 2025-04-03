@@ -24,7 +24,7 @@ def load_image_path(key, out_field, d):
     return d
 
 def convert_tensor(key, d):
-    d[key] = 1.0 - torch.from_numpy(np.array(d[key], np.float32, copy=False)).transpose(0, 1).contiguous().view(1, d[key].size[0], d[key].size[1])
+    d[key] = 1.0 - torch.from_numpy(np.asarray(d[key], np.float32)).transpose(0, 1).contiguous().view(1, d[key].size[0], d[key].size[1])
     return d
 
 def rotate_image(key, rot, d):

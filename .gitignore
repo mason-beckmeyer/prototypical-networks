@@ -3,6 +3,8 @@
 *.egg-info/
 results/
 data/*/data
+data/test/*
+data/train/*
 dist
 build
 *.zip
