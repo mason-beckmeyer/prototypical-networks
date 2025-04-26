@@ -39,6 +39,7 @@ class Protonet(nn.Module):
         x = torch.cat([xs.view(n_class * n_support, *xs.size()[2:]),
                        xq.view(n_class * n_query, *xq.size()[2:])], 0)
 
+        x = x.view(-1, *x.size()[2:])
         z = self.encoder.forward(x)
         z_dim = z.size(-1)
 
@@ -46,6 +47,7 @@ class Protonet(nn.Module):
         zq = z[n_class*n_support:]
 
         dists = euclidean_dist(zq, z_proto)
+        print("distances", dists.shape)
 
         log_p_y = F.log_softmax(-dists, dim=1).view(n_class, n_query, -1)
 

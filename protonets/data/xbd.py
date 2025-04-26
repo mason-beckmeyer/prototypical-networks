@@ -88,8 +88,14 @@ class XBDPatchDataset(Dataset):
 
         xs, xq = [], []
         for cls_idx, cls in enumerate(selected_classes):
-            examples = random.sample(self.data[cls], k_shot + q_query)
-            support, query = examples[:k_shot], examples[k_shot:]
+            # Ensure the sample size does not exceed the number of available examples
+            available_examples = self.data[cls]
+            num_samples = min(len(available_examples), k_shot + q_query)
+            if num_samples < k_shot + q_query:
+                print(f"⚠️ Not enough examples for class {cls}. Reducing sample size to {num_samples}.")
+
+            examples = random.sample(available_examples, num_samples)
+            support, query = examples[:k_shot], examples[k_shot:num_samples]
 
             def load_patch(example):
                 # Load pre-disaster and post-disaster images as RGB
@@ -103,6 +109,13 @@ class XBDPatchDataset(Dataset):
 
                 return patch
 
+            if not support:
+                print(f"⚠️ No support examples for class {cls}. Skipping.")
+                continue
+            if not query:
+                print(f"⚠️ No query examples for class {cls}. Skipping.")
+                continue
+
             xs.append(torch.stack([load_patch(e) for e in support]))
             xq.append(torch.stack([load_patch(e) for e in query]))
 
@@ -112,7 +125,7 @@ class XBDPatchDataset(Dataset):
         }
 
     def __len__(self):
-        return 100000  # arbitrarily large since we're sampling episodes
+        return 10  # arbitrarily large since we're sampling episodes
 
     def __getitem__(self, idx):
         return self.get_episode()

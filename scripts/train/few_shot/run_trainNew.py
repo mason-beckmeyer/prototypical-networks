@@ -11,15 +11,18 @@ parser.add_argument('--model.hid_dim', type=int, default=64, help='Hidden layer 
 parser.add_argument('--model.z_dim', type=int, default=64, help='Latent dimension')
 parser.add_argument('--log.exp_dir', type=str, default='results', help='Directory to save logs and models')
 parser.add_argument('--log.fields', type=str, default='loss,acc', help='Fields to log')
+default_model_name = 'protonet_conv'
 
+parser.add_argument('--model.model_name', type=str, default=default_model_name, metavar='MODELNAME',
+                    help="model name (default: {:s})". format(default_model_name))
 # Few-shot episode settings
-parser.add_argument('--data.way', type=int, default=2, help='Number of classes per episode')
+parser.add_argument('--data.way', type=int, default=4, help='Number of classes per episode')
 parser.add_argument('--data.shot', type=int, default=5, help='Number of support examples per class')
 parser.add_argument('--data.query', type=int, default=5, help='Number of query examples per class')
 
 # Training config
-parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+parser.add_argument('--lr', type=float, default=0.00001, help='Learning rate')
 parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
 parser.add_argument('--decay_every', type=int, default=20, help='StepLR decay every N epochs')
 parser.add_argument('--optim_method', type=str, default='Adam', help='Optimizer method')

@@ -57,7 +57,8 @@ def main(opt):
         from protonets.utils.model import evaluate
         evaluate(state['model'], val_loader, meters['test'], desc=f"Epoch {state['epoch']} validation")
 
-        print(f"Epoch {state['epoch']:02d}:", {k: f"{v.mean:.4f}" for k, v in meters['val'].items()})
+        print(f"Epoch {state['epoch']:02d}:", {k: f"{v.mean:.4f}" for k, v in meters['test'].items()})
+
 
         model_path = os.path.join(opt['log.exp_dir'], 'best_model.pt')
         torch.save(state['model'].cpu(), model_path)

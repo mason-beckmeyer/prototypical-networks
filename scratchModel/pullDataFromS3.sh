@@ -25,7 +25,7 @@ download() {
     echo "Downloading $COUNT images from s3://$BUCKET/$s3_folder to $local_dir"
 
     aws s3 ls "s3://$BUCKET/$s3_folder/gt_post/" | head -n "$COUNT" | awk '{print $4}' | while read -r file; do
-        if [ -n "$file" ]; then
+        if [ -n "$file" then
             echo " -> Downloading: $file"
 
             base_file="${file/_target/}"

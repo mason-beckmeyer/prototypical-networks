@@ -2,9 +2,9 @@
 *.swp
 *.egg-info/
 results/
-data/*/data
-data/test/*
-data/train/*
+scratchModel/data/*/data
+scratchModel/data/test/*
+scratchModel/data/train/*
 dist
 build
 *.zip
