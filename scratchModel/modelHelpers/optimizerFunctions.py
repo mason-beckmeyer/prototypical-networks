@@ -3,6 +3,7 @@ import gc
 import torch
 from functools import lru_cache
 from PIL import Image
+from pathlib import Path  # Add this import if not already present
 
 
 def optimize_memory():
@@ -33,3 +34,37 @@ def custom_collate(batch):
         combined_tensors.append(torch.stack([img[i] for img in images]))
 
     return combined_tensors, torch.tensor(labels), meta
+
+
+def find_best_model(directory=None):
+    """Find the best model file in the directory based on accuracy in filename"""
+    if directory is None:
+        directory = "/Users/mbbec/PycharmProjects/prototypical-networks"
+
+    # Convert string to Path object
+    if isinstance(directory, str):
+        directory = Path(directory)
+
+    model_files = list(directory.glob("protonet_best_val_*.pth"))
+    if not model_files:
+        return None
+
+    # Extract accuracies from filenames using regex
+    import re
+    best_acc = 0
+    best_file = None
+    for file in model_files:
+        match = re.search(r'acc(\d+\.\d+)\.pth', str(file))
+        if match:
+            acc = float(match.group(1))
+            if acc > best_acc:
+                best_acc = acc
+                best_file = file
+
+    if best_file:
+        print(f"Found best model: {best_file} (accuracy: {best_acc:.4f})")
+    else:
+        print("No model files found")
+
+    return best_file
+

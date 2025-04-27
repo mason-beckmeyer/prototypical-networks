@@ -13,7 +13,7 @@ import matplotlib.cm
 from tqdm import tqdm
 import copy
 import torch.serialization
-from modelHelpers.optimizerFunctions import optimize_memory,cached_image_load,custom_collate
+from modelHelpers.optimizerFunctions import optimize_memory,cached_image_load,custom_collate,find_best_model
 
 
 DAMAGE_LABELS = {
@@ -85,17 +85,24 @@ class ProtoNetEnhanced(nn.Module):
                 nn.Conv2d(input_channels, hidden_dim, 3, padding=1),
                 nn.BatchNorm2d(hidden_dim),
                 nn.ReLU(),
-                ResidualBlock(hidden_dim, hidden_dim),
-                CBAM(hidden_dim),
                 nn.MaxPool2d(2),
-                ResidualBlock(hidden_dim, hidden_dim * 2, stride=2),
+
+                # Deeper residual blocks
+                ResidualBlock(hidden_dim, hidden_dim * 2),
                 CBAM(hidden_dim * 2),
-                nn.Dropout(dropout_rate),
-                nn.AdaptiveAvgPool2d(4)  # Ensures fixed spatial size
+                nn.MaxPool2d(2),
+
+                ResidualBlock(hidden_dim * 2, hidden_dim * 4),
+                CBAM(hidden_dim * 4),
+                nn.MaxPool2d(2),
+
+                ResidualBlock(hidden_dim * 4, hidden_dim * 8),
+                CBAM(hidden_dim * 8),
+                nn.AdaptiveAvgPool2d(2)  # Final pool to fixed size  # Ensures fixed spatial size
             ) for _ in range(num_scales)
         ])
         # Compute the flattened feature size: hidden_dim * 2 * 4 * 4
-        self.feature_dim = (hidden_dim * 2) * 4 * 4
+        self.feature_dim = (hidden_dim * 8) * 2 * 2
         self.fusion = nn.Conv1d(self.feature_dim, hidden_dim, 1)
         self.dropout = nn.Dropout(dropout_rate)
 
@@ -113,10 +120,11 @@ class ProtoNetEnhanced(nn.Module):
         return prototypes
 
     def compute_distances(self, query_features, prototypes):
-        """Compute distances using efficient broadcasting"""
-        # Use broadcasting for all distance calculations at once
-        # Shape: [queries, 1, features] - [1, prototypes, features] -> [queries, prototypes]
-        return torch.cdist(query_features.unsqueeze(1), prototypes.unsqueeze(0), p=2).squeeze(1)
+        # Normalize features for cosine similarity
+        query_features = F.normalize(query_features, dim=1)
+        prototypes = F.normalize(prototypes, dim=1)
+        # Negative cosine similarity (-1 * cos) for loss minimization
+        return -torch.mm(query_features, prototypes.t())
 
     def forward(self, x_list):
         features = []
@@ -185,8 +193,11 @@ class XBDPatchDatasetEnhanced(Dataset):
     def _default_transform(self, patch_size):
         return transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.3),
             transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
+            transforms.RandomResizedCrop(size=(patch_size, patch_size), scale=(0.8, 1.0)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
             transforms.Resize((patch_size, patch_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
@@ -296,20 +307,23 @@ class XBDPatchDatasetEnhanced(Dataset):
 
         return combined_images, patch_info['label'], patch_info
 
-    def sample_episode(self, n_way: int, k_shot: int, q_query: int) -> Dict:
+    def sample_episode(self, n_way: int, k_shot: int, q_query: int,selected_classes=None) -> Dict:
         """Efficiently sample episode with optimized memory usage"""
         # 1. Pre-filter viable classes (classes with enough samples)
-        viable_classes = [cls for cls, examples in self.patches_by_class.items()
-                          if len(examples) >= k_shot + q_query]
+        if selected_classes is None:
+            # Original code for selecting viable classes
+            viable_classes = [cls for cls, examples in self.patches_by_class.items()
+                              if len(examples) >= k_shot + q_query]
 
-        if len(viable_classes) < n_way:
-            print(f"⚠️ Not enough examples for {n_way}-way. Reducing to {len(viable_classes)}-way.")
-            n_way = len(viable_classes)
-            if n_way == 0:
-                raise ValueError("No classes have sufficient examples for episode sampling")
+            if len(viable_classes) < n_way:
+                print(f"⚠️ Not enough examples for {n_way}-way. Reducing to {len(viable_classes)}-way.")
+                n_way = len(viable_classes)
+                if n_way == 0:
+                    raise ValueError("No classes have sufficient examples for episode sampling")
 
-        # 2. Select classes with random sampling
-        selected_original_classes = random.sample(viable_classes, k=n_way)
+            selected_original_classes = random.sample(viable_classes, k=n_way)
+        else:
+            selected_original_classes = selected_classes
 
         # 3. Prepare containers
         support_images = []
@@ -407,24 +421,29 @@ def get_prediction_support_set(train_dataset: XBDPatchDatasetEnhanced, k_shot: i
     Optional[List[torch.Tensor]], Optional[torch.Tensor], Optional[List[int]]]:
     support_images = []
     support_episode_labels = []
-    original_class_order = sorted(list(DAMAGE_LABELS.values()))
-    n_way = len(original_class_order)
 
-    print(f"Attempting to sample {k_shot}-shot support set for {n_way} classes...")
+    # Only use classes that have sufficient examples in the dataset
+    available_classes = [label for label, patches in train_dataset.patches_by_class.items()
+                         if len(patches) >= k_shot]
 
-    for i, original_label in enumerate(original_class_order):
-        episode_label = i
+    if not available_classes:
+        print(f"FATAL ERROR: No classes have sufficient examples for {k_shot}-shot support set")
+        return None, None, None
+
+    print(f"Creating support set with {len(available_classes)} available classes: {available_classes}")
+
+    # Map original labels to sequential episode labels (0, 1, 2, ...)
+    original_class_order = sorted(available_classes)
+    episode_label_map = {original_label: i for i, original_label in enumerate(original_class_order)}
+
+    for original_label in original_class_order:
+        episode_label = episode_label_map[original_label]
         class_patches_info = train_dataset.patches_by_class.get(original_label, [])
         num_available = len(class_patches_info)
 
-        if num_available == 0:
-            print(
-                f"FATAL ERROR: No training patches found for class {original_label} ({get_damage_name(original_label)}). Cannot build support set.")
-            return None, None, None
-
         if num_available < k_shot:
             print(
-                f"Warning: Class {original_label} ({get_damage_name(original_label)}) only has {num_available} training samples (need {k_shot}). Sampling with replacement.")
+                f"Warning: Class {original_label} ({get_damage_name(original_label)}) only has {num_available} samples (need {k_shot}). Sampling with replacement.")
             selected_patches_info = random.choices(class_patches_info, k=k_shot)
         else:
             selected_patches_info = random.sample(class_patches_info, k=k_shot)
@@ -438,17 +457,13 @@ def get_prediction_support_set(train_dataset: XBDPatchDatasetEnhanced, k_shot: i
                 support_episode_labels.append(episode_label)
                 loaded_count += 1
             except Exception as e:
-                print(f"Error loading support patch {patch_info}: {e}. Skipping.")
+                print(f"Error loading support patch: {e}. Skipping.")
 
-        if loaded_count != k_shot:
-            print(f"Warning: Loaded only {loaded_count}/{k_shot} support samples for class {original_label}.")
-            if loaded_count == 0:
-                print(f"FATAL ERROR: Failed to load any support samples for class {original_label}.")
-                return None, None, None
-
-    if not support_images or len(support_episode_labels) != n_way * k_shot:
         print(
-            f"Error: Failed to load the required number of support images ({len(support_images)} loaded, expected {n_way * k_shot}). Cannot proceed.")
+            f"Loaded {loaded_count}/{k_shot} support samples for class {original_label} ({get_damage_name(original_label)})")
+
+    if not support_images:
+        print("FATAL ERROR: Failed to load any support samples")
         return None, None, None
 
     support_images_tensors = [torch.stack([img[i] for img in support_images]).to(device) for i in
@@ -489,9 +504,11 @@ def visualize_predictions(model: ProtoNetEnhanced, vis_dataset: XBDPatchDatasetE
     if support_images is None:
         print("Failed to create support set. Aborting visualization.")
         return
-    if len(class_order) != len(DAMAGE_LABELS):
-        print(
-            f"Warning: Support set only contains prototypes for {len(class_order)}/{len(DAMAGE_LABELS)} classes. Predictions limited.")
+    n_way = len(class_order)
+    print(f"Working with {n_way}-way classification using available classes")
+    if n_way < len(DAMAGE_LABELS):
+        print(f"Note: Only {n_way}/{len(DAMAGE_LABELS)} damage classes available in support set")
+        print(f"Available classes: {[get_damage_name(cls) for cls in class_order]}")
 
     try:
         with torch.no_grad():
@@ -517,10 +534,11 @@ def visualize_predictions(model: ProtoNetEnhanced, vis_dataset: XBDPatchDatasetE
 
             pre_img_orig = Image.open(metadata['pre_path']).convert('RGB')
             post_img_orig = Image.open(metadata['post_path']).convert('RGB')
-            coords = metadata['coords'][128]  # Use 128x128 for visualization
-            if not (isinstance(coords, tuple) and len(coords) == 4 and all(isinstance(c, int) for c in coords)):
-                print(f"Error: Invalid coordinates format in metadata for index {idx}: {coords}. Skipping.")
-                continue
+            coords_raw = metadata['coords'][128]  # Use 128x128 for visualization
+            coords = tuple(int(c) for c in coords_raw)
+            # if not (isinstance(coords, tuple) and len(coords) == 4 and all(isinstance(c, int) for c in coords)):
+            #     print(f"Error: Invalid coordinates format in metadata for index {idx}: {coords}. Skipping.")
+            #     continue
             pre_patch_orig = pre_img_orig.crop(coords)
             post_patch_orig = post_img_orig.crop(coords)
 
@@ -579,9 +597,49 @@ def train_protonet_with_patches(model: ProtoNetEnhanced, train_dataset: XBDPatch
                                 val_interval: int = 100, early_stopping_patience: Optional[int] = None,
                                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> ProtoNetEnhanced:
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, num_episodes // 5), gamma=0.5)
+    class_weights = {label: 1.0 / len(patches) for label, patches in train_dataset.patches_by_class.items()}
+    class_weights = {k: v / min(class_weights.values()) for k, v in class_weights.items()}
+    print(f"Using class weights: {class_weights}")
 
+    def weighted_sample_episode(n_way, k_shot, q_query):
+        # Get viable classes with weighted probabilities
+        viable_classes = []
+        class_probabilities = []
+        for cls, examples in train_dataset.patches_by_class.items():
+            if len(examples) >= k_shot + q_query:
+                viable_classes.append(cls)
+                class_probabilities.append(class_weights[cls])
+
+        # Normalize probabilities
+        class_probabilities = np.array(class_probabilities) / sum(class_probabilities)
+
+        # Sample classes using weighted probabilities
+        if len(viable_classes) < n_way:
+            print(f"⚠️ Not enough examples for {n_way}-way. Reducing to {len(viable_classes)}-way.")
+            n_way = len(viable_classes)
+            if n_way == 0:
+                raise ValueError("No classes have sufficient examples for episode sampling")
+
+        # Use weighted sampling
+        episode_classes = np.random.choice(
+            viable_classes,
+            size=min(n_way, len(viable_classes)),
+            replace=False,
+            p=class_probabilities
+        )
+
+        # Now continue with the rest of the episode creation logic similar to train_dataset.sample_episode
+        # (collecting samples for support/query sets)
+
+        # Use train_dataset's original method but with our selected classes
+        return train_dataset.sample_episode(n_way, k_shot, q_query, selected_classes=episode_classes)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=20,
+        T_mult=2
+    )
     scaler = torch.cuda.amp.GradScaler() if device.startswith('cuda') else None
 
 
@@ -602,6 +660,8 @@ def train_protonet_with_patches(model: ProtoNetEnhanced, train_dataset: XBDPatch
         optimizer.zero_grad(set_to_none=True)
         try:
             episode_data = train_dataset.sample_episode(n_way, k_shot, q_query)
+            episode_data = weighted_sample_episode(n_way, k_shot, q_query)
+
             xs, xq = episode_data['xs'], episode_data['xq']
             ys, yq = episode_data['ys'].to(device), episode_data['yq'].to(device)
             xs = [x.to(device) for x in xs]
@@ -618,7 +678,7 @@ def train_protonet_with_patches(model: ProtoNetEnhanced, train_dataset: XBDPatch
             continue
 
         try:
-            with torch.cuda.amp.autocast('cuda',enabled=scaler is not None):
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
                 print(f"Episode {episode + 1}: xs shapes: {[x.shape for x in xs]}")
                 support_features = model(xs)
                 print(f"Episode {episode + 1}: support_features shape: {support_features.shape}")
@@ -713,6 +773,9 @@ def train_protonet_with_patches(model: ProtoNetEnhanced, train_dataset: XBDPatch
     plt.savefig('training_curves.png')
     print("Saved training curves to training_curves.png")
     plt.close()
+
+    optimize_memory()
+
 
     print("\nTraining finished.")
     if best_model_state is not None:
@@ -927,8 +990,8 @@ def visualize_results(results: Dict, prefix: str = "") -> None:
 
 
 RUN_VISUALIZATION_ONLY = False
-MODEL_LOAD_PATH = 'protonet_best_val_ep200_acc0.7842.pth'
-NUM_VISUALIZATIONS = 15
+MODEL_LOAD_PATH = find_best_model()
+NUM_VISUALIZATIONS = 30
 
 def main() -> None:
     torch.manual_seed(42)
@@ -944,7 +1007,7 @@ def main() -> None:
     q_query = 15
     validation_split_ratio = 0.2
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    max_patches_per_class_extraction = 50
+    max_patches_per_class_extraction = 150
 
     train_transforms = {
         ps: transforms.Compose([
