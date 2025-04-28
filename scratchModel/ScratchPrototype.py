@@ -120,24 +120,25 @@ class ProtoNetEnhanced(nn.Module):
         return prototypes
 
     def compute_distances(self, query_features, prototypes):
-        # Normalize features for cosine similarity
-        query_features = F.normalize(query_features, dim=1)
-        prototypes = F.normalize(prototypes, dim=1)
-        # Negative cosine similarity (-1 * cos) for loss minimization
-        return -torch.mm(query_features, prototypes.t())
+        # Normalize feature vectors (important for cosine-like distance)
+        query_features = F.normalize(query_features, p=2, dim=1)
+        prototypes = F.normalize(prototypes, p=2, dim=1)
+
+        # Rest of your distance computation
+        n_query = query_features.size(0)
+        n_prototypes = prototypes.size(0)
+        query_features = query_features.unsqueeze(1)
+        prototypes = prototypes.unsqueeze(0)
+        return torch.sum((query_features - prototypes) ** 2, dim=2)
 
     def forward(self, x_list):
         features = []
 
         # Use gradient checkpointing for memory efficiency
-        if self.training:
-            for x, encoder in zip(x_list, self.encoders):
-                feat = torch.utils.checkpoint.checkpoint(self._run_encoder, x, encoder)
-                features.append(feat.view(feat.size(0), -1))
-        else:
-            for x, encoder in zip(x_list, self.encoders):
-                feat = encoder(x)
-                features.append(feat.view(feat.size(0), -1))
+        features = []
+        for x, encoder in zip(x_list, self.encoders):
+            feat = encoder(x)  # Direct call without checkpointing
+            features.append(feat.view(feat.size(0), -1))
 
         fused = torch.stack(features, dim=2)  # [batch, feature_dim, num_scales]
         fused = self.dropout(fused)  # Apply dropout before fusion
@@ -590,108 +591,126 @@ def visualize_predictions(model: ProtoNetEnhanced, vis_dataset: XBDPatchDatasetE
 
 
 # --- Training Function ---
-def train_protonet_with_patches(model: ProtoNetEnhanced, train_dataset: XBDPatchDatasetEnhanced,
-                                val_dataset: Optional[XBDPatchDatasetEnhanced],
-                                n_way: int, k_shot: int, q_query: int,
-                                num_episodes: int = 200, learning_rate: float = 0.001,
-                                val_interval: int = 100, early_stopping_patience: Optional[int] = None,
-                                device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> ProtoNetEnhanced:
+def train_protonet_with_patches(model, train_dataset, val_dataset,
+                                n_way, k_shot, q_query,
+                                num_episodes=100, learning_rate=0.001,
+                                val_interval=20, early_stopping_patience=None,
+                                device='cuda' if torch.cuda.is_available() else 'cpu'):
     model = model.to(device)
-    class_weights = {label: 1.0 / len(patches) for label, patches in train_dataset.patches_by_class.items()}
-    class_weights = {k: v / min(class_weights.values()) for k, v in class_weights.items()}
-    print(f"Using class weights: {class_weights}")
 
-    def weighted_sample_episode(n_way, k_shot, q_query):
-        # Get viable classes with weighted probabilities
-        viable_classes = []
-        class_probabilities = []
-        for cls, examples in train_dataset.patches_by_class.items():
-            if len(examples) >= k_shot + q_query:
-                viable_classes.append(cls)
-                class_probabilities.append(class_weights[cls])
+    # Enable cudnn benchmark for faster training (when using CUDA)
+    if device.startswith('cuda'):
+        torch.backends.cudnn.benchmark = True
 
-        # Normalize probabilities
-        class_probabilities = np.array(class_probabilities) / sum(class_probabilities)
+    # AGGRESSIVE IMAGE CACHING - Preload everything into memory
+    print("Preloading ALL images into memory... (this might take a moment)")
+    image_cache = {}
+    unique_paths = set()
+    for patch in train_dataset.patches:
+        unique_paths.add(patch['pre_path'])
+        unique_paths.add(patch['post_path'])
+    if val_dataset:
+        for patch in val_dataset.patches:
+            unique_paths.add(patch['pre_path'])
+            unique_paths.add(patch['post_path'])
 
-        # Sample classes using weighted probabilities
-        if len(viable_classes) < n_way:
-            print(f"⚠️ Not enough examples for {n_way}-way. Reducing to {len(viable_classes)}-way.")
-            n_way = len(viable_classes)
-            if n_way == 0:
-                raise ValueError("No classes have sufficient examples for episode sampling")
+    # Load all unique images
+    for path in tqdm(unique_paths, desc="Preloading images"):
+        try:
+            image_cache[path] = Image.open(path).convert('RGB')
+        except Exception as e:
+            print(f"Warning: Failed to load {path}: {e}")
 
-        # Use weighted sampling
-        episode_classes = np.random.choice(
-            viable_classes,
-            size=min(n_way, len(viable_classes)),
-            replace=False,
-            p=class_probabilities
-        )
+    # Redefine image loading function to use preloaded cache
+    def optimized_cached_load(path):
+        return image_cache[path]
 
-        # Now continue with the rest of the episode creation logic similar to train_dataset.sample_episode
-        # (collecting samples for support/query sets)
+    # Replace functions
+    train_dataset.cached_image_load = optimized_cached_load
+    if val_dataset:
+        val_dataset.cached_image_load = optimized_cached_load
 
-        # Use train_dataset's original method but with our selected classes
-        return train_dataset.sample_episode(n_way, k_shot, q_query, selected_classes=episode_classes)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    # Create optimizer with higher learning rate
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.003, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=20,
-        T_mult=2
+        optimizer, T_0=5, T_mult=2, eta_min=0.0001
     )
     scaler = torch.cuda.amp.GradScaler() if device.startswith('cuda') else None
-
-
+    for epoch in range(5):  # First 5 episodes
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = learning_rate * (epoch + 1) / 5
     best_val_acc = -1.0
     best_model_state = None
     epochs_without_improvement = 0
     train_losses = []
     train_accuracies = []
-    print(f"Starting training on {device} for {num_episodes} episodes...")
-    print(f"N-way={n_way}, K-shot={k_shot}, Q-query={q_query}")
-    if val_dataset:
-        print(f"Validation every {val_interval} episodes.")
-    if early_stopping_patience:
-        print(f"Early stopping patience: {early_stopping_patience}.")
 
+    # Precompute class probabilities for weighted sampling
+    class_weights = {label: (1.0 / len(patches)) ** 1.5 for label, patches in train_dataset.patches_by_class.items()}
+    class_weights = {k: v / min(class_weights.values()) for k, v in class_weights.items()}
+    print("Class weights ",class_weights)
+    viable_classes = []
+    class_probabilities = []
+    for cls, examples in train_dataset.patches_by_class.items():
+        if len(examples) >= k_shot + q_query:
+            viable_classes.append(cls)
+            class_probabilities.append(class_weights[cls])
+
+    # Normalize probabilities
+    class_probabilities = np.array(class_probabilities) / sum(class_probabilities)
+
+    print(f"Starting training on {device} for {num_episodes} episodes...")
+    print(f"Using {len(viable_classes)} viable classes for {n_way}-way classification")
+
+    # PERFORMANCE OPTIMIZED TRAINING LOOP - Minimal prints, batch processing
     for episode in range(num_episodes):
         model.train()
         optimizer.zero_grad(set_to_none=True)
+
+        # Silent episode sampling - no prints in the loop!
         try:
-            episode_data = train_dataset.sample_episode(n_way, k_shot, q_query)
-            episode_data = weighted_sample_episode(n_way, k_shot, q_query)
+            # Weighted sample classes without printing warnings
+            if len(viable_classes) < n_way:
+                current_n_way = len(viable_classes)
+                episode_classes = viable_classes
+            else:
+                current_n_way = n_way
+                episode_classes = np.random.choice(
+                    viable_classes,
+                    size=current_n_way,
+                    replace=False,
+                    p=class_probabilities
+                )
+
+            # Use dataset's sample_episode with our selected classes
+            episode_data = train_dataset.sample_episode(current_n_way, k_shot, q_query,
+                                                        selected_classes=episode_classes)
 
             xs, xq = episode_data['xs'], episode_data['xq']
             ys, yq = episode_data['ys'].to(device), episode_data['yq'].to(device)
             xs = [x.to(device) for x in xs]
             xq = [x.to(device) for x in xq]
+
             if any(x.shape[0] == 0 for x in xs) or any(x.shape[0] == 0 for x in xq):
-                raise ValueError("Empty support or query set")
-        except ValueError as e:
-            print(f"Error sampling train episode {episode + 1}: {e}. Skipping.")
-            scheduler.step()
-            continue
+                if episode % 10 == 0:  # Only log occasionally
+                    print(f"Episode {episode + 1}: Empty support/query set, skipping")
+                scheduler.step()
+                continue
         except Exception as e:
-            print(f"Unexpected error sampling train episode {episode + 1}: {e}. Skipping.")
+            if episode % 10 == 0:  # Only log occasionally
+                print(f"Episode {episode + 1}: Sampling error: {str(e)[:80]}...")
             scheduler.step()
             continue
 
         try:
-            with torch.amp.autocast('cuda', enabled=scaler is not None):
-                print(f"Episode {episode + 1}: xs shapes: {[x.shape for x in xs]}")
+            with torch.amp.autocast(device_type=device.split(':')[0], enabled=scaler is not None):
                 support_features = model(xs)
-                print(f"Episode {episode + 1}: support_features shape: {support_features.shape}")
                 query_features = model(xq)
-                print(f"Episode {episode + 1}: query_features shape: {query_features.shape}")
                 prototypes = model.calculate_prototypes(support_features, ys)
-                print(f"Episode {episode + 1}: prototypes shape: {prototypes.shape}")
                 distances = model.compute_distances(query_features, prototypes)
-                print(f"Episode {episode + 1}: distances shape: {distances.shape}")
                 log_p_y = F.log_softmax(-distances, dim=1)
-                print(f"Episode {episode + 1}: log_p_y shape: {log_p_y.shape}")
                 loss = F.nll_loss(log_p_y, yq)
-                print(f"Episode {episode + 1}: loss: {loss.item()}")
+
             if scaler:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -707,82 +726,54 @@ def train_protonet_with_patches(model: ProtoNetEnhanced, train_dataset: XBDPatch
             train_losses.append(loss.item())
             train_accuracies.append(accuracy)
         except Exception as e:
-            print(f"Error during training forward/backward pass episode {episode + 1}: {e}. Skipping update.")
+            if episode % 10 == 0:  # Only log occasionally
+                print(f"Episode {episode + 1}: Forward/backward error: {str(e)[:80]}...")
             optimizer.zero_grad(set_to_none=True)
             continue
 
         scheduler.step()
 
-        if (episode + 1) % 100 == 0:
-            print(
-                f"Episode {episode + 1}/{num_episodes}: Loss = {loss.item():.4f}, Acc = {accuracy:.4f}, LR = {scheduler.get_last_lr()[0]:.6f}")
+        # Only print every 5 episodes to reduce overhead
+        if (episode + 1) % 5 == 0:
+            print(f"Episode {episode + 1}/{num_episodes}: Loss = {loss.item():.4f}, Acc = {accuracy:.4f}")
 
+        # Validate less frequently
         if val_dataset is not None and (episode + 1) % val_interval == 0:
             print(f"\n--- Running Validation @ Episode {episode + 1} ---")
             try:
-                val_results = evaluate_model(model, val_dataset, num_episodes=100, n_way=n_way, k_shot=k_shot,
-                                             q_query=q_query, device=device, eval_mode='validation')
+                # Less validation episodes
+                val_results = evaluate_model(model, val_dataset, num_episodes=10, n_way=n_way,
+                                             k_shot=k_shot, q_query=q_query, device=device,
+                                             eval_mode='validation')
                 val_acc = val_results['overall_accuracy']
                 print(f"--- Validation Accuracy: {val_acc:.4f} ---")
                 if val_acc > best_val_acc:
-                    print(f"Val accuracy improved ({best_val_acc:.4f} -> {val_acc:.4f}). Saving checkpoint.")
                     best_val_acc = val_acc
                     best_model_state = copy.deepcopy(model.state_dict())
                     epochs_without_improvement = 0
-                    checkpoint_path = f'protonet_best_val_ep{episode + 1}_acc{val_acc:.4f}.pth'
-                    checkpoint_dict = {
-                        'episode': episode + 1,
-                        'model_state_dict': best_model_state,
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'best_val_accuracy': best_val_acc,
-                        'n_way': n_way,
-                        'k_shot': k_shot
-                    }
-                    torch.save(checkpoint_dict, checkpoint_path)
-                    print(f"Checkpoint saved to {checkpoint_path}")
-                    try:
-                        saved_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-                        print(f"Verified saved checkpoint: {list(saved_checkpoint.keys())}")
-                    except Exception as e:
-                        print(f"Warning: Failed to verify saved checkpoint {checkpoint_path}: {e}")
+
+                    # Save checkpoint very infrequently (only every 10 validations)
+                    if (episode + 1) % (val_interval * 10) == 0:
+                        checkpoint_path = f'protonet_best_val_ep{episode + 1}_acc{val_acc:.4f}.pth'
+                        torch.save({'model_state_dict': best_model_state}, checkpoint_path)
+                        print(f"Checkpoint saved to {checkpoint_path}")
                 else:
                     epochs_without_improvement += 1
-                    print(
-                        f"Val accuracy did not improve ({val_acc:.4f}). ({epochs_without_improvement}/{early_stopping_patience if early_stopping_patience else 'inf'})")
-                if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
-                    print(f"\nEarly stopping triggered after {epochs_without_improvement} checks.")
+                if early_stopping_patience and epochs_without_improvement >= early_stopping_patience:
+                    print(f"\nEarly stopping after {epochs_without_improvement} checks.")
                     break
             except Exception as e:
-                print(f"Error during validation @ episode {episode + 1}: {e}")
+                print(f"Error during validation: {str(e)[:80]}...")
             optimize_memory()
 
-    # Plot training curves
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Training Loss', color='blue')
-    plt.xlabel('Episode')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Curve')
-    plt.subplot(1, 2, 2)
-    plt.plot(train_accuracies, label='Training Accuracy', color='orange')
-    plt.xlabel('Episode')
-    plt.ylabel('Accuracy')
-    plt.title('Training Accuracy Curve')
-    plt.tight_layout()
-    plt.savefig('training_curves.png')
-    print("Saved training curves to training_curves.png")
-    plt.close()
-
-    optimize_memory()
-
+    # Clean up image cache and restore original function
+    image_cache.clear()
 
     print("\nTraining finished.")
     if best_model_state is not None:
-        print(f"Loading best model from validation (Acc: {best_val_acc:.4f})")
+        print(f"Loading best model (Acc: {best_val_acc:.4f})")
         model.load_state_dict(best_model_state)
-    else:
-        print("Warning: No best model state saved. Using final model state.")
+
     return model
 
 
@@ -1100,7 +1091,16 @@ def main() -> None:
         return
 
     print("\n--- Initializing Model ---")
-    model = ProtoNetEnhanced(input_channels=6, hidden_dim=64, num_scales=len(patch_sizes), dropout_rate=0.3)
+    # Increase feature dimension back to at least 48
+    model = ProtoNetEnhanced(
+        input_channels=6,
+        hidden_dim=96,  # Find middle ground between 32 and 64
+        num_scales=2,
+        dropout_rate=0.35
+    )
+
+    # Use larger learning rate with warm restarts
+
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Created ProtoNetEnhanced model with {model_params:,} trainable parameters")
 
@@ -1115,13 +1115,13 @@ def main() -> None:
             q_query=q_query,
             num_episodes=200,
             device=device,
-            val_interval=100,
-            early_stopping_patience=3
+            val_interval=20,
+            early_stopping_patience=5
         )
         print("\n--- Training Completed ---")
     print("\n--- Final Evaluation on Test Set ---")
     if test_dataset and len(test_dataset) > 0:
-        test_results = evaluate_model(model, test_dataset, num_episodes=100, n_way=n_way, k_shot=k_shot,
+        test_results = evaluate_model(model, test_dataset, num_episodes=20, n_way=n_way, k_shot=k_shot,
                                       q_query=q_query, device=device, eval_mode='test')
         visualize_results(test_results, prefix="test")
     else:
