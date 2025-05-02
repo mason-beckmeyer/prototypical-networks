@@ -34,17 +34,17 @@ class CBAM(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
         )
-        # Streamlined spatial attention
+        #Streamlined spatial attention
         self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Channel attention with inplace operations where possible
+        #Channel attention with inplace operations where possible
         y = self.avg_pool(x)
         y = self.sigmoid(self.fc(y))
         x = x * y
 
-        # Spatial attention with combined pooling operations
+        #Spatial attention with combined pooling operations
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         avg_out = torch.mean(x, dim=1, keepdim=True)
         spatial_input = torch.cat([max_out, avg_out], dim=1)
@@ -75,7 +75,7 @@ class ResidualBlock(nn.Module):
         return F.relu(out)
 
 
-# --- Enhanced ProtoNet with Multi-Scale and Attention ---
+# --- ProtoNet with Multi-Scale and Attention ---
 class ProtoNetEnhanced(nn.Module):
     def __init__(self, input_channels=6, hidden_dim=64, num_scales=2, dropout_rate=0.3):
         super(ProtoNetEnhanced, self).__init__()
@@ -124,7 +124,7 @@ class ProtoNetEnhanced(nn.Module):
         query_features = F.normalize(query_features, p=2, dim=1)
         prototypes = F.normalize(prototypes, p=2, dim=1)
 
-        # Rest of your distance computation
+
         n_query = query_features.size(0)
         n_prototypes = prototypes.size(0)
         query_features = query_features.unsqueeze(1)
@@ -310,9 +310,9 @@ class XBDPatchDatasetEnhanced(Dataset):
 
     def sample_episode(self, n_way: int, k_shot: int, q_query: int,selected_classes=None) -> Dict:
         """Efficiently sample episode with optimized memory usage"""
-        # 1. Pre-filter viable classes (classes with enough samples)
+        # Pre-filter viable classes (classes with enough samples)
         if selected_classes is None:
-            # Original code for selecting viable classes
+
             viable_classes = [cls for cls, examples in self.patches_by_class.items()
                               if len(examples) >= k_shot + q_query]
 
@@ -326,14 +326,14 @@ class XBDPatchDatasetEnhanced(Dataset):
         else:
             selected_original_classes = selected_classes
 
-        # 3. Prepare containers
+        #Prepare containers
         support_images = []
         query_images = []
         support_labels = []
         query_labels = []
         original_to_episode_label = {orig_label: i for i, orig_label in enumerate(selected_original_classes)}
 
-        # 4. Process selected classes efficiently
+        #Process selected classes efficiently
         for original_label in selected_original_classes:
             episode_label = original_to_episode_label[original_label]
             class_patches = self.patches_by_class[original_label]
@@ -354,7 +354,7 @@ class XBDPatchDatasetEnhanced(Dataset):
                 query_images.append(images)
                 query_labels.append(episode_label)
 
-        # 5. Create and return the episode data
+        # Create and return the episode data
         xs = [torch.stack([img[i] for img in support_images]) for i in range(len(self.patch_sizes))]
         xq = [torch.stack([img[i] for img in query_images]) for i in range(len(self.patch_sizes))]
 
@@ -598,12 +598,11 @@ def train_protonet_with_patches(model, train_dataset, val_dataset,
                                 device='cuda' if torch.cuda.is_available() else 'cpu'):
     model = model.to(device)
 
-    # Enable cudnn benchmark for faster training (when using CUDA)
     if device.startswith('cuda'):
         torch.backends.cudnn.benchmark = True
 
-    # AGGRESSIVE IMAGE CACHING - Preload everything into memory
-    print("Preloading ALL images into memory... (this might take a moment)")
+    # aggressive caching
+    print("Preloading ALL images into memory")
     image_cache = {}
     unique_paths = set()
     for patch in train_dataset.patches:
@@ -662,12 +661,12 @@ def train_protonet_with_patches(model, train_dataset, val_dataset,
     print(f"Starting training on {device} for {num_episodes} episodes...")
     print(f"Using {len(viable_classes)} viable classes for {n_way}-way classification")
 
-    # PERFORMANCE OPTIMIZED TRAINING LOOP - Minimal prints, batch processing
+    # PERFORMANCE OPTIMIZED TRAINING LOOP
     for episode in range(num_episodes):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        # Silent episode sampling - no prints in the loop!
+        # Silent episode sampling
         try:
             # Weighted sample classes without printing warnings
             if len(viable_classes) < n_way:
@@ -753,7 +752,7 @@ def train_protonet_with_patches(model, train_dataset, val_dataset,
                     epochs_without_improvement = 0
 
                     # Save checkpoint very infrequently (only every 10 validations)
-                    if (episode + 1) % (val_interval * 10) == 0:
+                    if (episode + 1) % (5) == 0:
                         checkpoint_path = f'protonet_best_val_ep{episode + 1}_acc{val_acc:.4f}.pth'
                         torch.save({'model_state_dict': best_model_state}, checkpoint_path)
                         print(f"Checkpoint saved to {checkpoint_path}")
@@ -1091,10 +1090,10 @@ def main() -> None:
         return
 
     print("\n--- Initializing Model ---")
-    # Increase feature dimension back to at least 48
+
     model = ProtoNetEnhanced(
         input_channels=6,
-        hidden_dim=96,  # Find middle ground between 32 and 64
+        hidden_dim=96,
         num_scales=2,
         dropout_rate=0.35
     )
