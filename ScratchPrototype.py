@@ -1,18 +1,28 @@
+
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Union, Any
-import matplotlib.pyplot as plt
-import matplotlib.cm
+from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 import copy
-import torch.serialization
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, accuracy_score
+from sklearn.utils import resample
+import csv
+import os
+from collections import Counter, defaultdict
+import matplotlib.pyplot as plt
+import time
+from torch.amp import autocast, GradScaler
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 DAMAGE_LABELS = {
     'no-damage': 1,
@@ -20,1095 +30,1243 @@ DAMAGE_LABELS = {
     'major-damage': 3,
     'destroyed': 4
 }
+skipped_episodes = 0
+same_image_episodes = Counter()
 
+# --- Squeeze-and-Excitation Block ---
+class SEBlock(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
 
-# --- CBAM Module for Attention ---
-class CBAM(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(CBAM, self).__init__()
-        self.channel_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1),
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+# --- ProtoNet with SE Blocks and Grad-CAM ---
+class ProtoNet(nn.Module):
+    def __init__(self, input_channels=6, feature_dim=64):
+        super(ProtoNet, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(input_channels, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1),
-            nn.Sigmoid()
+            SEBlock(64),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            SEBlock(64),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            SEBlock(64),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            SEBlock(64),
+            nn.Dropout(0.5)
         )
-        self.spatial_attention = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=7, padding=3),
-            nn.Sigmoid()
-        )
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((8, 8))
+        self.fc = nn.Linear(64 * 8 * 8, feature_dim)
+        self.feature_dim = feature_dim
+        self.last_conv = self.encoder[15]
+        self.gradients = None
+        self.activations = None
 
-    def forward(self, x):
-        channel_att = self.channel_attention(x)
-        x = x * channel_att
-        max_pool = torch.max(x, dim=1, keepdim=True)[0]
-        avg_pool = torch.mean(x, dim=1, keepdim=True)
-        spatial_input = torch.cat([max_pool, avg_pool], dim=1)
-        spatial_att = self.spatial_attention(spatial_input)
-        x = x * spatial_att
-        return x
+    def save_gradient(self, grad):
+        self.gradients = grad
 
+    def forward(self, x, return_features=False):
+        feature_maps = self.encoder(x)
+        pooled_features = self.adaptive_pool(feature_maps)
+        features = pooled_features.view(pooled_features.size(0), -1)
+        features = self.fc(features)
+        if return_features:
+            return features, feature_maps
+        return features
 
-# --- Residual Block for Deeper Encoder ---
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride=stride),
-                nn.BatchNorm2d(out_channels)
-            )
+    def calculate_prototypes(self, features, labels, robust=False):
+        unique_labels = torch.unique(labels)
+        feature_dim = features.shape[1]
+        device = features.device
+        prototype_list = []
 
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        return F.relu(out)
+        for label_val_tensor in unique_labels:
+            label_val = label_val_tensor.item()
+            mask = (labels == label_val_tensor)
+            class_features = features[mask]
+            if class_features.shape[0] == 0:
+                logging.warning(f"Empty class for label {label_val} in prototype calculation")
+                prototype_list.append(torch.zeros(feature_dim, device=device, requires_grad=False))
+                continue
+            if robust:
+                prototype = torch.median(class_features, dim=0)[0]
+            else:
+                prototype = class_features.mean(dim=0)
+            prototype_list.append(prototype)
 
+        if not prototype_list:
+            raise ValueError("No prototypes computed; all classes in support set were empty.")
+        return torch.stack(prototype_list, dim=0)
 
-# --- Enhanced ProtoNet with Multi-Scale and Attention ---
-class ProtoNetEnhanced(nn.Module):
-    def __init__(self, input_channels=6, hidden_dim=64, num_scales=2, dropout_rate=0.3):
-        super(ProtoNetEnhanced, self).__init__()
-        self.num_scales = num_scales
-        self.encoders = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(input_channels, hidden_dim, 3, padding=1),
-                nn.BatchNorm2d(hidden_dim),
-                nn.ReLU(),
-                ResidualBlock(hidden_dim, hidden_dim),
-                CBAM(hidden_dim),
-                nn.MaxPool2d(2),
-                ResidualBlock(hidden_dim, hidden_dim * 2, stride=2),
-                CBAM(hidden_dim * 2),
-                nn.Dropout(dropout_rate),
-                nn.AdaptiveAvgPool2d(4)  # Ensures fixed spatial size
-            ) for _ in range(num_scales)
-        ])
-        # Compute the flattened feature size: hidden_dim * 2 * 4 * 4
-        self.feature_dim = (hidden_dim * 2) * 4 * 4
-        self.fusion = nn.Conv1d(self.feature_dim, hidden_dim, 1)
-        self.dropout = nn.Dropout(dropout_rate)
+    def compute_distances(self, query_features, prototypes):
+        diff = query_features.unsqueeze(1) - prototypes.unsqueeze(0)
+        distances = torch.sum(diff ** 2, dim=2)
+        return distances
 
-    def forward(self, x_list):
-        features = []
-        for x, encoder in zip(x_list, self.encoders):
-            feat = encoder(x)  # [batch, hidden_dim * 2, 4, 4]
-            feat = feat.view(feat.size(0), -1)  # [batch, hidden_dim * 2 * 4 * 4]
-            features.append(feat)
-        fused = torch.stack(features, dim=2)  # [batch, feature_dim, num_scales]
-        fused = self.dropout(fused)  # Apply dropout before fusion
-        fused = self.fusion(fused)  # [batch, hidden_dim, num_scales]
-        # Instead of squeeze(2), reshape to [batch, hidden_dim]
-        batch_size = fused.size(0)
-        fused = fused.view(batch_size, -1)  # [batch, hidden_dim]
-        return fused
+    def get_se_l2_loss(self, l2_lambda=1e-4):
+        l2_loss = 0.0
+        for module in self.modules():
+            if isinstance(module, SEBlock):
+                for param in module.parameters():
+                    if param.requires_grad:
+                        l2_loss += torch.sum(param ** 2)
+        return l2_lambda * l2_loss
 
+    def compute_gradcam(self, x, target_class, device='cpu'):
+        was_training = self.training
+        self.eval()
+        x = x.to(device)
+        x.requires_grad_(True)
+        self.gradients = None
+        self.activations = None
 
-# --- Enhanced XBDPatchDataset with Multi-Scale---
-class XBDPatchDatasetEnhanced(Dataset):
-    def __init__(self, root_dir: Path, split: str = 'train', patch_sizes: List[int] = [128, 256],
-                 transform: Optional[Dict[int, transforms.Compose]] = None, max_patches_per_class: int = 100,
+        def forward_hook(module, input, output):
+            self.activations = output
+
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0]
+
+        forward_handle = self.last_conv.register_forward_hook(forward_hook)
+        backward_handle = self.last_conv.register_backward_hook(backward_hook)
+
+        try:
+            features, _ = self.forward(x, return_features=True)
+            self.zero_grad()
+            score = features[0, target_class]
+            score.backward()
+            if self.gradients is None or self.activations is None:
+                logging.warning("Gradients or activations not captured")
+                return np.zeros((x.size(2), x.size(3)))
+            pooled_gradients = torch.mean(self.gradients, dim=[2, 3])
+            for i in range(self.activations.size(1)):
+                self.activations[0, i] *= pooled_gradients[0, i]
+            heatmap = torch.mean(self.activations[0], dim=0)
+            heatmap = F.relu(heatmap)
+            heatmap /= torch.max(heatmap) + 1e-8
+            heatmap = heatmap.detach().cpu().numpy()
+        except Exception as e:
+            logging.error(f"Grad-CAM failed: {str(e)}")
+            heatmap = np.zeros((x.size(2), x.size(3)))
+        finally:
+            forward_handle.remove()
+            backward_handle.remove()
+        if was_training:
+            self.train()
+        return heatmap
+
+    def get_prototype_patches(self, support_features, support_labels, support_patches, num_top=3):
+        prototypes = self.calculate_prototypes(support_features, support_labels)
+        prototype_patches = {label.item(): [] for label in torch.unique(support_labels)}
+        for i, label in enumerate(torch.unique(support_labels)):
+            label_val = label.item()
+            mask = (support_labels == label)
+            class_features = support_features[mask]
+            class_patches = [support_patches[j] for j in range(len(support_patches)) if mask[j]]
+            if len(class_features) == 0:
+                continue
+            prototype = prototypes[i]
+            distances = torch.sum((class_features - prototype) ** 2, dim=1)
+            _, top_indices = torch.topk(distances, k=min(num_top, len(distances)), largest=False)
+            prototype_patches[label_val] = [class_patches[j] for j in top_indices]
+        return prototype_patches
+
+class XBDPatchDataset(Dataset):
+    def __init__(self, root_dir: Path, split: str = 'train', patch_size: int = 64,
+                 transform: Optional[transforms.Compose] = None, max_patches_per_class: int = 100,
                  skip_extraction: bool = False, device: str = 'cpu',
-                 initial_patches: Optional[List[Dict[str, Union[str, int, Tuple[int, int, int, int]]]]] = None,
-                 initial_patches_by_class: Optional[
-                     Dict[int, List[Dict[str, Union[str, int, Tuple[int, int, int, int]]]]]] = None):
+                 initial_patches: Optional[List[Tuple]] = None,
+                 initial_patches_by_class: Optional[Dict[int, List[Tuple]]] = None):
         self.root_dir_path = root_dir / split
-        self.patch_sizes = patch_sizes
-        self.transform = transform or {ps: self._default_transform(ps) for ps in patch_sizes}
+        self.patch_size = patch_size
+        self.transform = transform or self._default_transform()
         self.max_patches_per_class = max_patches_per_class
         self.split_name = split
         self.device = device
+        self.patch_metadata = []
+        self.metadata_by_class = {label: [] for label in DAMAGE_LABELS.values()}
 
         if skip_extraction and initial_patches is not None and initial_patches_by_class is not None:
-            self.patches = initial_patches
-            self.patches_by_class = initial_patches_by_class
+            self._load_initial_metadata(initial_patches, initial_patches_by_class)
         else:
-            print(f"Indexing patches from {split} split at {self.root_dir_path}...")
+            logging.info(f"Indexing patches from {split} split at {self.root_dir_path}")
             self.pre_image_dir = self.root_dir_path / 'img_pre'
             self.post_image_dir = self.root_dir_path / 'img_post'
             self.post_mask_dir = self.root_dir_path / 'gt_post'
 
-            if not self.root_dir_path.exists():
-                raise FileNotFoundError(f"Root directory for split '{split}' not found: {self.root_dir_path}")
-            if not self.pre_image_dir.exists() or not self.post_image_dir.exists() or not self.post_mask_dir.exists():
-                raise FileNotFoundError(
-                    f"Required subdirectories (img_pre, img_post, gt_post) not found in {self.root_dir_path}")
+            if not all([self.root_dir_path.exists(), self.pre_image_dir.exists(),
+                        self.post_image_dir.exists(), self.post_mask_dir.exists()]):
+                raise FileNotFoundError(f"Required directories not found in {self.root_dir_path}")
 
-            self.patches_by_class = self._extract_patches_by_class()
-            self.patches = []
-            for label, patches in self.patches_by_class.items():
-                self.patches.extend(patches)
+            all_post_images = sorted(list(self.post_image_dir.glob('*.png')))
+            if not all_post_images:
+                raise FileNotFoundError(f"No post-disaster images found in {self.post_image_dir}")
 
-            print(f"Total patches in '{split}': {len(self.patches)}")
-            for label, patches in self.patches_by_class.items():
-                print(f"  Class {label} ({self._get_damage_label_name_static(label)}): {len(patches)} patches")
-            if not self.patches:
-                print(f"Warning: No patches were extracted for the '{split}' split. Check paths and data.")
+            class_4_images = []
+            other_images = []
+            for img_path in all_post_images:
+                base_name = img_path.stem.replace('_post_disaster', '')
+                post_mask_path = self.post_mask_dir / f"{base_name}_post_disaster_target{img_path.suffix}"
+                if not post_mask_path.exists():
+                    continue
+                with Image.open(post_mask_path).convert('L') as mask:
+                    mask_np = np.array(mask)
+                    if 4 in mask_np:
+                        class_4_images.append(img_path)
+                    else:
+                        other_images.append(img_path)
 
-    def _default_transform(self, patch_size):
+            logging.info(f"Total images: {len(all_post_images)}, Class 4 images: {len(class_4_images)}, Other images: {len(other_images)}")
+
+            class_4_images.sort()
+            other_images.sort()
+
+            total_images = len(all_post_images)
+            test_size = int(0.2 * total_images)
+            min_class_4_test = max(1, int(0.2 * len(class_4_images))) if class_4_images else 0
+
+            test_class_4_images = class_4_images[:min_class_4_test]
+            remaining_test_slots = test_size - len(test_class_4_images)
+            test_other_images = other_images[:remaining_test_slots] if remaining_test_slots > 0 else []
+
+            if split == 'test':
+                post_images = test_class_4_images + test_other_images
+            else:
+                train_class_4_images = class_4_images[min_class_4_test:]
+                train_other_images = other_images[len(test_other_images):]
+                post_images = train_class_4_images + train_other_images
+
+            logging.info(f"{split} split: {len(post_images)} images, Class 4 images: {sum(1 for img in post_images if img in class_4_images)}")
+
+            self._extract_patches_by_class(post_images)
+
+    def _default_transform(self):
         return transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.Resize((patch_size, patch_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
         ])
 
-    @staticmethod
-    def _get_damage_label_name_static(label_id: int) -> str:
-        for name, id_val in DAMAGE_LABELS.items():
-            if id_val == label_id:
-                return name
-        return f"Unknown ({label_id})"
+    def _load_initial_metadata(self, initial_patches, initial_patches_by_class):
+        for patch in initial_patches:
+            if not isinstance(patch, tuple) or len(patch) != 4:
+                continue
+            self.patch_metadata.append(patch)
+        for label, patches in initial_patches_by_class.items():
+            for patch in patches:
+                if not isinstance(patch, tuple) or len(patch) != 4 or patch[3] != label:
+                    continue
+                self.metadata_by_class[label].append(patch)
 
-    def _get_damage_label_name(self, label_id: int) -> str:
-        return self._get_damage_label_name_static(label_id)
-
-    def _extract_patches_by_class(self) -> Dict[int, List[Dict[str, Union[str, int, Tuple[int, int, int, int]]]]]:
-        patches_by_class = {label: [] for label in DAMAGE_LABELS.values()}
-        post_images = list(self.post_image_dir.glob('*.png'))
-        if not post_images:
-            print(f"Warning: No PNG images found in {self.post_image_dir}. Check directory/files.")
-            return patches_by_class
-
-        print(f"Found {len(post_images)} post-disaster images in {self.post_image_dir}")
+    def _extract_patches_by_class(self, post_images: List[Path]):
         for img_path in tqdm(post_images, desc=f"Processing images in {self.split_name}"):
             base_name = img_path.stem.replace('_post_disaster', '')
             post_mask_path = self.post_mask_dir / f"{base_name}_post_disaster_target{img_path.suffix}"
             pre_img_path = self.pre_image_dir / f"{base_name}_pre_disaster{img_path.suffix}"
 
-            if not post_mask_path.exists() or not pre_img_path.exists():
+            if not (post_mask_path.exists() and pre_img_path.exists()):
                 continue
 
-            try:
-                mask = Image.open(post_mask_path).convert('L')
+            with Image.open(post_mask_path).convert('L') as mask:
                 mask_np = np.array(mask)
                 img_height, img_width = mask_np.shape
+                unique_labels = np.unique(mask_np)
+                invalid_labels = [lbl for lbl in unique_labels if lbl not in DAMAGE_LABELS.values()]
+                if invalid_labels:
+                    logging.warning(f"Invalid labels {invalid_labels} found in mask {post_mask_path}, skipping invalid labels")
 
-                unique_labels_in_mask = np.unique(mask_np)
-                print(f"Processing {img_path.name}: Found labels {unique_labels_in_mask}")
-                relevant_labels = set(unique_labels_in_mask) & set(patches_by_class.keys())
-
-                if not relevant_labels:
-                    continue
-
-                for label in relevant_labels:
+                for label in DAMAGE_LABELS.values():
                     indices = np.argwhere(mask_np == label)
                     if len(indices) == 0:
                         continue
-
-                    np.random.shuffle(indices)
-                    num_to_sample = min(len(indices), self.max_patches_per_class)
+                    indices = indices[np.lexsort((indices[:, 1], indices[:, 0]))]
+                    num_to_sample = min(len(indices), self.max_patches_per_class) if label != 4 else len(indices)
                     sampled_indices = indices[:num_to_sample]
 
                     for y, x in sampled_indices:
-                        patch_info = {
-                            'pre_path': str(pre_img_path),
-                            'post_path': str(img_path),
-                            'coords': {},  # Store coords for each patch size
-                            'label': label
-                        }
-                        valid_patch = True
-                        for ps in self.patch_sizes:
-                            half_patch = ps // 2
-                            top = max(0, y - half_patch)
-                            left = max(0, x - half_patch)
-                            bottom = top + ps
-                            right = left + ps
+                        half_patch = self.patch_size // 2
+                        top, left = max(0, y - half_patch), max(0, x - half_patch)
+                        bottom, right = top + self.patch_size, left + self.patch_size
 
-                            if bottom > img_height:
-                                bottom = img_height
-                                top = max(0, bottom - ps)
-                            if right > img_width:
-                                right = img_width
-                                left = max(0, right - ps)
+                        if bottom > img_height:
+                            bottom, top = img_height, max(0, img_height - self.patch_size)
+                        if right > img_width:
+                            right, left = img_width, max(0, img_width - self.patch_size)
 
-                            if bottom - top != ps or right - left != ps:
-                                valid_patch = False
-                                break
+                        if bottom - top != self.patch_size or right - left != self.patch_size:
+                            continue
 
-                            patch_info['coords'][ps] = (left, top, right, bottom)
+                        coords = {'coords': {self.patch_size: (left, top, right, bottom)}}
+                        metadata = (str(pre_img_path), str(img_path), coords['coords'], label)
+                        self.patch_metadata.append(metadata)
+                        self.metadata_by_class[label].append(metadata)
 
-                        if valid_patch:
-                            patches_by_class[label].append(patch_info)
-            except Exception as e:
-                print(f"Error processing image {img_path.name}: {e}")
-                continue
-        return patches_by_class
+                # Log unique images per class
+                for label in DAMAGE_LABELS.values():
+                    unique_images = set(meta[1] for meta in self.metadata_by_class[label])
+                    logging.info(f"Class {label} ({get_damage_name(label)}): {len(unique_images)} unique images, {len(self.metadata_by_class[label])} patches")
 
-    def __len__(self) -> int:
-        return len(self.patches)
+    def __len__(self):
+        return len(self.patch_metadata)
 
-    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], int, Dict[str, Any]]:
-        if idx >= len(self.patches):
-            raise IndexError(
-                f"Index {idx} out of bounds for {self.split_name} dataset with length {len(self.patches)}")
-        patch_info = self.patches[idx]
+    def __getitem__(self, idx):
+        pre_path, post_path, coords, label = self.patch_metadata[idx]
+        with Image.open(pre_path).convert('RGB') as pre_image, Image.open(post_path).convert('RGB') as post_image:
+            left, top, right, bottom = [int(coord) for coord in coords[self.patch_size]]
+            pre_patch = pre_image.crop((left, top, right, bottom))
+            post_patch = post_image.crop((left, top, right, bottom))
+            pre_transformed = self.transform(pre_patch)
+            post_transformed = self.transform(post_patch)
+            combined = torch.cat((pre_transformed, post_transformed), dim=0)
+            return combined, label, pre_patch, post_patch
 
-        # Access fields using dictionary keys
-        pre_path = patch_info['pre_path']
-        post_path = patch_info['post_path']
-        label = patch_info['label']
-        metadata = {
-            'pre_path': pre_path,
-            'post_path': post_path,
-            'coords': patch_info['coords']
-        }
+    def sample_episode(self, n_way: int, k_shot: int, q_query: int, class_counts: Dict[int, int], episode_num: int,
+                       is_training: bool = False, class_counter: Counter = None):
+        global skipped_episodes, same_image_episodes
 
-        pre_image = Image.open(pre_path).convert('RGB')
-        post_image = Image.open(post_path).convert('RGB')
+        available_classes = [label for label, patches in self.metadata_by_class.items() if
+                            len(patches) >= (k_shot + q_query)]
+        logging.info(f"Episode {episode_num}: Available classes: {[get_damage_name(label) for label in available_classes]}, "
+                     f"Class 4 patches: {len(self.metadata_by_class[4])}")
 
-        # Convert coordinates to standard integers
-        coords = metadata['coords']  # Already a dict mapping patch sizes to coords
-        # Ensure all coordinates are integers (handle np.int64)
-        for ps in coords:
-            coords[ps] = tuple(int(coord) for coord in coords[ps])
-        metadata['coords'] = coords
-
-        transformed_pre_images, transformed_post_images = [], []
-        for ps in self.patch_sizes:
-            transform = self.transform[ps] if self.transform else None
-            pre_transformed = pre_image
-            post_transformed = post_image
-            if transform:
-                pre_transformed = transform(pre_transformed)
-                post_transformed = transform(post_transformed)
-            transformed_pre_images.append(pre_transformed)
-            transformed_post_images.append(post_transformed)
-
-        combined_images = [
-            torch.cat((pre_img, post_img), dim=0)  # Concatenate along channel dimension
-            for pre_img, post_img in zip(transformed_pre_images, transformed_post_images)
-        ]
-
-        return combined_images, label, metadata
-
-    def sample_episode(self, n_way: int, k_shot: int, q_query: int) -> Dict:
-        available_classes = [label for label, patches in self.patches_by_class.items() if
-                             len(patches) >= (k_shot + q_query)]
         if len(available_classes) < n_way:
-            print(
-                f"Warning: Requested {n_way}-way episode from '{self.split_name}', but only {len(available_classes)} classes have enough samples ({k_shot + q_query}). Sampling {len(available_classes)}-way instead.")
-            n_way = len(available_classes)
-            if n_way == 0:
-                raise ValueError(f"Cannot sample episode from '{self.split_name}': No classes have enough examples.")
+            raise ValueError(f"Not enough classes ({len(available_classes)} available, need {n_way})")
 
-        # Compute class sampling probabilities inversely proportional to class frequency
-        class_counts = {label: len(self.patches_by_class[label]) for label in available_classes}
-        total_patches = sum(class_counts.values())
-        inverse_frequencies = {label: (total_patches / count) if count > 0 else 0 for label, count in
-                               class_counts.items()}
-        total_inverse_freq = sum(inverse_frequencies.values())
-        class_probabilities = {label: freq / total_inverse_freq for label, freq in inverse_frequencies.items()}
+        # Probability-based class selection
+        valid_class_counts = {label: max(1, count) for label, count in class_counts.items()
+                              if count > 0 and label in available_classes}
+        prob_array = [1.0 / np.sqrt(valid_class_counts.get(label, 1)) if label in valid_class_counts else 1.0
+                      for label in available_classes]
+        total_prob = sum(prob_array)
+        prob_array = [p / total_prob if total_prob > 0 else 1.0 / len(available_classes) for p in prob_array]
+        logging.info(f"Episode {episode_num} Class probabilities: "
+                     f"{[f'Class {label} ({get_damage_name(label)}): {p:.4f}' for label, p in zip(available_classes, prob_array)]}")
 
-        # Sample classes based on inverse frequencies
-        selected_original_classes = random.choices(
-            available_classes,
-            weights=[class_probabilities[label] for label in available_classes],
-            k=n_way
-        )
-        # Ensure unique classes (if possible)
-        selected_original_classes = list(dict.fromkeys(selected_original_classes))
-        if len(selected_original_classes) < n_way:
-            remaining_classes = list(set(available_classes) - set(selected_original_classes))
-            if remaining_classes:
-                additional_classes = random.sample(remaining_classes,
-                                                   min(len(remaining_classes), n_way - len(selected_original_classes)))
-                selected_original_classes.extend(additional_classes)
-            if len(selected_original_classes) < n_way:
-                print(
-                    f"Warning: After sampling, only {len(selected_original_classes)} unique classes selected (needed {n_way}). Adjusting n_way.")
-                n_way = len(selected_original_classes)
+        # Force class 4 inclusion
+        force_class = None
+        if is_training and class_counter is not None and 4 in available_classes:
+            recent_class_4 = class_counter[4] / max(1, sum(class_counter.values()))
+            if recent_class_4 < 0.1 and episode_num % 25 == 0:
+                force_class = 4
+                logging.info(f"Episode {episode_num}: Forcing Class 4, recent proportion: {recent_class_4:.4f}")
+        elif not is_training and 4 in available_classes:
+            force_class = 4
+            logging.info(f"Episode {episode_num}: Forcing Class 4 in test set")
 
-        if not selected_original_classes:
-            raise ValueError(f"Failed to sample any classes for episode from '{self.split_name}'.")
+        # Select classes
+        max_attempts = 20
+        for attempt in range(max_attempts):
+            if force_class and force_class in available_classes:
+                temp_classes = [force_class]
+                remaining_classes = [c for c in available_classes if c != force_class]
+                remaining_probs = [p for c, p in zip(available_classes, prob_array) if c != force_class]
+                if remaining_probs and len(remaining_classes) >= (n_way - 1):
+                    remaining_probs = np.array(remaining_probs) / sum(remaining_probs)
+                    additional = np.random.choice(remaining_classes, size=n_way - 1, replace=False, p=remaining_probs)
+                    temp_classes.extend(additional.tolist())
+                    selected_classes = temp_classes
+                    break
+            else:
+                try:
+                    selected_classes = np.random.choice(available_classes, size=n_way, replace=False, p=prob_array).tolist()
+                    break
+                except ValueError:
+                    selected_classes = random.sample(available_classes, n_way)
+                    break
+        else:
+            selected_classes = random.sample(available_classes, min(n_way, len(available_classes)))
 
-        original_to_episode_label = {orig_label: i for i, orig_label in enumerate(selected_original_classes)}
+        episode_label_map = {i: orig_label for i, orig_label in enumerate(set(selected_classes))}
+        original_to_episode_label = {v: k for k, v in episode_label_map.items()}
+        logging.info(f"Episode {episode_num} selected classes: {[get_damage_name(label) for label in set(selected_classes)]}")
+
         support_images, query_images = [], []
         support_labels, query_labels = [], []
+        support_patches, query_patches = [], []
+        support_metadata, query_metadata = [], []
 
-        for original_label in selected_original_classes:
+        for original_label in set(selected_classes):
             episode_label = original_to_episode_label[original_label]
-            class_patches = self.patches_by_class[original_label]
-            if len(class_patches) < k_shot + q_query:
-                print(
-                    f"Warning: Class {original_label} ({self._get_damage_label_name_static(original_label)}) has only {len(class_patches)} samples. Sampling with replacement.")
-                selected_patches_info = random.choices(class_patches, k=k_shot + q_query)
+            class_metadata = self.metadata_by_class[original_label]
+            total_needed = k_shot + q_query
+
+            if len(class_metadata) < total_needed:
+                selected_metadata = class_metadata.copy()
+                selected_metadata.extend(random.choices(class_metadata, k=total_needed - len(class_metadata)))
             else:
-                selected_patches_info = random.sample(class_patches, k=k_shot + q_query)
-            support_patches_info = selected_patches_info[:k_shot]
-            query_patches_info = selected_patches_info[k_shot:]
+                selected_metadata = random.sample(class_metadata, total_needed)
 
-            for patch_info_list, img_list, label_list in [(support_patches_info, support_images, support_labels),
-                                                          (query_patches_info, query_images, query_labels)]:
-                for patch_info in patch_info_list:
-                    try:
-                        combined, _, _ = self.__getitem__(self.patches.index(patch_info))
-                        img_list.append(combined)
-                        label_list.append(episode_label)
-                    except Exception as e:
-                        print(
-                            f"Error loading patch during episode sampling ({self.split_name}): {patch_info}. Error: {e}. Skipping.")
+            image_sources = defaultdict(list)
+            for i, meta in enumerate(selected_metadata):
+                _, post_path, _, _ = meta
+                img_source = Path(post_path).stem
+                image_sources[img_source].append((i, meta))
 
-        expected_support_size = n_way * k_shot
-        expected_query_size = n_way * q_query
-        if len(support_images) != expected_support_size or len(query_images) != expected_query_size:
-            print(
-                f"Warning: Episode sampling ({self.split_name}) resulted in {len(support_images)}/{len(query_images)} samples. Expected {expected_support_size}/{expected_query_size}.")
+            image_keys = list(image_sources.keys())
+            random.shuffle(image_keys)
+            unique_images = len(image_keys)
 
-        xs = [torch.stack([img[i] for img in support_images]) for i in
-              range(len(self.patch_sizes))] if support_images else [torch.empty(0) for _ in
-                                                                    range(len(self.patch_sizes))]
-        xq = [torch.stack([img[i] for img in query_images]) for i in
-              range(len(self.patch_sizes))] if query_images else [torch.empty(0) for _ in range(len(self.patch_sizes))]
+            # Adjust k_shot and q_query based on unique images
+            k_shot_adjusted = k_shot
+            q_query_adjusted = q_query
+            if unique_images < k_shot + q_query:
+                if unique_images == 1:
+                    k_shot_adjusted = 1
+                    q_query_adjusted = 1
+                else:
+                    k_shot_adjusted = max(1, unique_images // 2)
+                    q_query_adjusted = max(1, unique_images - k_shot_adjusted)
+                logging.info(f"Class {original_label} ({get_damage_name(original_label)}): Adjusted k_shot={k_shot_adjusted}, q_query={q_query_adjusted} due to {unique_images} unique images")
+
+            # Sample patches, ensuring no patch overlap between support and query
+            support_indices = []
+            query_indices = []
+            if unique_images == 1 and k_shot_adjusted + q_query_adjusted <= len(class_metadata):
+                # For single-image classes (e.g., class 4), sample distinct patches
+                patch_indices = random.sample(range(len(selected_metadata)), k_shot_adjusted + q_query_adjusted)
+                support_indices = patch_indices[:k_shot_adjusted]
+                query_indices = patch_indices[k_shot_adjusted:k_shot_adjusted + q_query_adjusted]
+                logging.info(f"Class {original_label} ({get_damage_name(original_label)}): Using {len(support_indices)} support and {len(query_indices)} query patches from single image")
+            elif unique_images >= k_shot_adjusted + q_query_adjusted:
+                # Sufficient unique images: assign disjoint images
+                support_img_keys = image_keys[:k_shot_adjusted]
+                query_img_keys = image_keys[k_shot_adjusted:k_shot_adjusted + q_query_adjusted]
+                for img_key in support_img_keys:
+                    for idx, _ in image_sources[img_key]:
+                        if len(support_indices) < k_shot_adjusted:
+                            support_indices.append(idx)
+                for img_key in query_img_keys:
+                    for idx, _ in image_sources[img_key]:
+                        if len(query_indices) < q_query_adjusted:
+                            query_indices.append(idx)
+            else:
+                # Allow same-image sampling with relaxed threshold
+                same_image_ratio = same_image_episodes[original_label] / (episode_num + 1) if episode_num > 0 else 0.0
+                if same_image_ratio < 0.5:
+                    logging.warning(f"Class {original_label} ({get_damage_name(original_label)}): Allowing same-image sampling "
+                                    f"(ratio={same_image_ratio:.4f}, unique_images={unique_images}, needed={k_shot_adjusted + q_query_adjusted})")
+                    same_image_episodes[original_label] += 1
+                    support_indices = random.sample(range(len(selected_metadata)), k_shot_adjusted)
+                    remaining = [i for i in range(len(selected_metadata)) if i not in support_indices]
+                    query_indices = random.sample(remaining, min(q_query_adjusted, len(remaining)))
+                else:
+                    logging.warning(f"Episode {episode_num}: Skipping due to insufficient unique images for class {original_label} "
+                                    f"(unique_images={unique_images}, needed={k_shot_adjusted + q_query_adjusted}, same_image_ratio={same_image_ratio:.4f})")
+                    skipped_episodes += 1
+                    return None
+
+            if not support_indices or not query_indices:
+                logging.warning(f"Episode {episode_num}: No valid support or query indices for class {original_label}")
+                skipped_episodes += 1
+                return None
+
+            metadata_to_idx = {id(metadata): idx for idx, metadata in enumerate(self.patch_metadata)}
+            support_metadata.extend([selected_metadata[i] for i in support_indices])
+            query_metadata.extend([selected_metadata[i] for i in query_indices])
+
+            for meta in support_metadata[-k_shot_adjusted:]:
+                idx = metadata_to_idx.get(id(meta))
+                if idx is not None:
+                    combined, _, pre_patch, post_patch = self[idx]
+                    support_images.append(combined)
+                    support_labels.append(episode_label)
+                    support_patches.append((pre_patch, post_patch))
+            for meta in query_metadata[-q_query_adjusted:]:
+                idx = metadata_to_idx.get(id(meta))
+                if idx is not None:
+                    combined, _, pre_patch, post_patch = self[idx]
+                    query_images.append(combined)
+                    query_labels.append(episode_label)
+                    query_patches.append((pre_patch, post_patch))
+
+        if not support_images or not query_images:
+            logging.warning(f"Empty episode {episode_num}, total skipped: {skipped_episodes + 1}")
+            skipped_episodes += 1
+            return None
+
+        support_image_sources = set(meta[1] for meta in support_metadata)
+        query_image_sources = set(meta[1] for meta in query_metadata)
+        if support_image_sources & query_image_sources:
+            logging.warning(f"Episode {episode_num}: Overlap in support and query images: {support_image_sources & query_image_sources}")
+
+        xs = torch.stack(support_images)
+        xq = torch.stack(query_images)
         ys = torch.tensor(support_labels, dtype=torch.long)
         yq = torch.tensor(query_labels, dtype=torch.long)
 
-        return {'xs': xs, 'xq': xq, 'ys': ys, 'yq': yq, 'original_classes': selected_original_classes,
-                'label_map': original_to_episode_label}
+        episode_support = Counter(yq.tolist())
+        valid_labels = all(k in episode_label_map for k in episode_support)
+        if not valid_labels:
+            logging.warning(f"Invalid labels in episode {episode_num}: {episode_support}")
+            skipped_episodes += 1
+            return None
 
+        logging.info(f"Episode {episode_num} query distribution: "
+                     f"{[f'Class {get_damage_name(episode_label_map.get(k, -1))} (Episode {k}): {v}' for k, v in episode_support.items()]}")
 
-# --- Visualization Functions ---
+        episode_idx_to_original_label_map = {v: k for k, v in original_to_episode_label.items()}
+        return {
+            'xs': xs, 'xq': xq, 'ys': ys, 'yq': yq,
+            'original_classes': list(set(selected_classes)),
+            'episode_original_to_episode_label_map': original_to_episode_label,
+            'episode_idx_to_original_label_map': episode_idx_to_original_label_map,
+            'support_patches': support_patches,
+            'query_patches': query_patches,
+            'support_metadata': support_metadata,
+            'query_metadata': query_metadata
+        }
+
+# --- Training Function ---
+def train_protonet_with_patches(model, train_dataset, val_dataset, n_way, k_shot, q_query, num_episodes=400,
+                                device='cpu', class_counts=None, gamma_base=2.0, label_smoothing=0.05, patience=2, config=None):
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
+    scaler = GradScaler() if device == 'cuda' else None
+    best_val_acc = -1.0
+    best_model_state = None
+    no_improve_count = 0
+
+    log_file = 'training_logs.csv'
+    with open(log_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Episode', 'Train_Loss', 'Train_Acc', 'Val_Loss', 'Val_Acc',
+                         'Val_Macro_Precision', 'Val_Macro_Recall', 'Val_Macro_F1',
+                         'Val_Class1_Acc', 'Val_Class2_Acc', 'Val_Class3_Acc', 'Val_Class4_Acc',
+                         'Val_Class1_Support', 'Val_Class2_Support', 'Val_Class3_Support', 'Val_Class4_Support'])
+
+    episode_class_counts = Counter()
+    logging.info("Generating fixed validation episodes for consistent evaluation...")
+    fixed_val_episodes = []
+    val_class_counter = Counter()
+
+    for i in range(30):
+        val_episode = val_dataset.sample_episode(n_way, k_shot, q_query, class_counts, i,
+                                                 is_training=False, class_counter=val_class_counter)
+        if val_episode is not None:
+            fixed_val_episodes.append(val_episode)
+            for label in val_episode['original_classes']:
+                if label in DAMAGE_LABELS.values():
+                    val_class_counter[label] += 1
+
+    logging.info(f"Generated {len(fixed_val_episodes)} fixed validation episodes")
+    logging.info(f"Validation class distribution: {dict(val_class_counter)}")
+
+    def focal_loss(logits, targets, num_classes, class_counts=None, gamma=gamma_base, ls=label_smoothing):
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = F.softmax(logits, dim=1)
+        target_probs = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        target_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal_weight = (1 - target_probs) ** gamma
+        if class_counts is not None:
+            total_samples = sum(class_counts.values())
+            class_weights = torch.tensor([total_samples / (num_classes * class_counts.get(t.item(), 1))
+                                          for t in targets], device=logits.device)
+            focal_weight = focal_weight * class_weights
+        loss = -focal_weight * target_log_probs
+        if ls > 0:
+            smooth_loss = -log_probs.mean(dim=1)
+            loss = (1 - ls) * loss + ls * smooth_loss
+        return loss.mean()
+
+    def mixup_query_only(x, y, alpha=0.2):
+        if alpha <= 0 or x.size(0) < 2:
+            return x, y, y, 1.0
+        batch_size = x.size(0)
+        lam = np.random.beta(alpha, alpha)
+        index = torch.randperm(batch_size).to(x.device)
+        mixed_x = lam * x + (1 - lam) * x[index]
+        y_a, y_b = y, y[index]
+        return mixed_x, y_a, y_b, lam
+
+    def evaluate_fixed_validation_episodes(model, episodes, device):
+        model.eval()
+        total_loss = 0.0
+        all_predicted = []
+        all_true = []
+        class_correct = defaultdict(int)
+        class_total = defaultdict(int)
+
+        with torch.no_grad():
+            for episode_data in episodes:
+                if episode_data is None:
+                    continue
+                xs, xq = episode_data['xs'].to(device), episode_data['xq'].to(device)
+                ys, yq = episode_data['ys'].to(device), episode_data['yq'].to(device)
+                support_features = model(xs)
+                query_features = model(xq)
+                prototypes = model.calculate_prototypes(support_features, ys)
+                distances = model.compute_distances(query_features, prototypes)
+                num_classes = len(set(episode_data['original_classes']))
+                loss = focal_loss(-distances, yq, num_classes, class_counts)
+                total_loss += loss.item()
+                predicted = torch.argmin(distances, dim=1)
+                all_predicted.extend(predicted.cpu().numpy())
+                all_true.extend(yq.cpu().numpy())
+                for pred, true in zip(predicted.cpu().numpy(), yq.cpu().numpy()):
+                    class_total[true] += 1
+                    if pred == true:
+                        class_correct[true] += 1
+
+        avg_loss = total_loss / len(episodes) if episodes else 0.0
+        overall_acc = accuracy_score(all_true, all_predicted) if all_true else 0.0
+        class_accuracies = {class_idx: class_correct[class_idx] / class_total[class_idx] if class_total[class_idx] > 0 else 0.0
+                            for class_idx in class_total}
+        return {
+            'loss': avg_loss,
+            'accuracy': overall_acc,
+            'class_accuracies': class_accuracies,
+            'class_support': dict(class_total)
+        }
+
+    for episode in tqdm(range(1, num_episodes + 1), desc="Training"):
+        model.train()
+        episode_data = train_dataset.sample_episode(n_way, k_shot, q_query, class_counts, episode,
+                                                    is_training=True, class_counter=episode_class_counts)
+        if episode_data is None:
+            continue
+        xs, xq = episode_data['xs'].to(device), episode_data['xq'].to(device)
+        ys, yq = episode_data['ys'].to(device), episode_data['yq'].to(device)
+        for label in episode_data['original_classes']:
+            if label in DAMAGE_LABELS.values():
+                episode_class_counts[label] += 1
+
+        xs_clean = xs
+        xq_mixed, yq_a, yq_b, lam_q = mixup_query_only(xq, yq, alpha=0.2)
+        optimizer.zero_grad()
+
+        if device == 'cuda' and scaler is not None:
+            with autocast('cuda'):
+                support_features = model(xs_clean)
+                query_features = model(xq_mixed)
+                prototypes = model.calculate_prototypes(support_features, ys)
+                distances = model.compute_distances(query_features, prototypes)
+                num_classes = len(set(episode_data['original_classes']))
+                loss = lam_q * focal_loss(-distances, yq_a, num_classes, class_counts) + \
+                       (1 - lam_q) * focal_loss(-distances, yq_b, num_classes, class_counts)
+                se_l2_loss = model.get_se_l2_loss()
+                total_loss = loss + se_l2_loss
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            support_features = model(xs_clean)
+            query_features = model(xq_mixed)
+            prototypes = model.calculate_prototypes(support_features, ys)
+            distances = model.compute_distances(query_features, prototypes)
+            num_classes = len(set(episode_data['original_classes']))
+            loss = lam_q * focal_loss(-distances, yq_a, num_classes, class_counts) + \
+                   (1 - lam_q) * focal_loss(-distances, yq_b, num_classes, class_counts)
+            se_l2_loss = model.get_se_l2_loss()
+            total_loss = loss + se_l2_loss
+            total_loss.backward()
+            optimizer.step()
+
+        scheduler.step()
+
+        if episode % 25 == 0 and val_dataset and fixed_val_episodes:
+            logging.info(f"Evaluating on {len(fixed_val_episodes)} fixed validation episodes...")
+            val_results = evaluate_fixed_validation_episodes(model, fixed_val_episodes, device)
+            val_acc = val_results['accuracy']
+            val_loss = val_results['loss']
+            logging.info(f"Episode {episode}: Val Loss = {val_loss:.4f}, Val Acc = {val_acc:.4f}")
+            logging.info(f"  Class accuracies: {val_results['class_accuracies']}")
+            logging.info(f"  Class support: {val_results['class_support']}")
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = copy.deepcopy(model.state_dict())
+                logging.info(f"Updated best model with validation accuracy: {best_val_acc:.4f}")
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if no_improve_count >= patience:
+                logging.info(f"Early stopping at episode {episode}")
+                break
+
+            with open(log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                class_accs = val_results['class_accuracies']
+                class_support = val_results['class_support']
+                writer.writerow([
+                    episode, total_loss.item(), 0.0,
+                    val_loss, val_acc, 0.0, 0.0, 0.0,
+                    class_accs.get(0, 0.0), class_accs.get(1, 0.0),
+                    class_accs.get(2, 0.0), class_accs.get(3, 0.0),
+                    class_support.get(0, 0), class_support.get(1, 0),
+                    class_support.get(2, 0), class_support.get(3, 0)
+                ])
+
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'best_val_acc': best_val_acc,
+        'episode': episode,
+        'final_class_counts': dict(episode_class_counts),
+        'val_class_counts': dict(val_class_counter),
+        'config': config if 'config' in globals() else {}
+    }, 'trained_model.pth')
+
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+        logging.info(f"Loaded best model with validation accuracy: {best_val_acc:.4f}")
+    return model
+
+# --- Evaluation Function ---
+def evaluate_model(model, dataset, num_episodes=100, n_way=3, k_shot=10, q_query=5, device='cpu', class_counts=None,
+                   start_episode=1, vis_dir='visualizations'):
+    model.eval()
+    all_accuracies = []
+    inference_times = []
+    class_correct_counts = {label: 0 for label in DAMAGE_LABELS.values()}
+    class_total_counts = {label: 0 for label in DAMAGE_LABELS.values()}
+    all_true_labels = []
+    all_pred_labels = []
+    episode_class_counts = Counter()
+    episode_confusion_counts = {label: Counter() for label in DAMAGE_LABELS.values()}
+    all_heatmaps = []
+    all_prototype_patches = []
+    heatmap_variances = []
+    prototype_distances = {label: [] for label in DAMAGE_LABELS.values()}
+    global_image_count = 0
+
+    os.makedirs(vis_dir, exist_ok=True)
+
+    def save_visualization(heatmap, patch, filename, label, predicted, is_pre=False):
+        if label not in DAMAGE_LABELS.values() or predicted not in DAMAGE_LABELS.values():
+            logging.warning(f"Skipping visualization for invalid label {label} or predicted {predicted}")
+            return
+        plt.figure(figsize=(6, 6))
+        patch_np = np.array(patch.convert('RGB')) / 255.0
+        heatmap_resized = np.array(Image.fromarray(heatmap).resize((patch_np.shape[1], patch_np.shape[0])))
+        plt.imshow(patch_np)
+        plt.imshow(heatmap_resized, cmap='jet', alpha=0.5)
+        plt.title(f"{'Pre' if is_pre else 'Post'}-Disaster Patch\nTrue: {get_damage_name(label)}, Pred: {get_damage_name(predicted)}")
+        plt.axis('off')
+        plt.savefig(os.path.join(vis_dir, filename), bbox_inches='tight')
+        plt.close()
+
+    for episode in tqdm(range(start_episode, start_episode + num_episodes), desc="Evaluating"):
+        episode_data = dataset.sample_episode(n_way, k_shot, q_query, class_counts, episode, is_training=False,
+                                              class_counter=episode_class_counts)
+        if episode_data is None:
+            logging.info(f"Skipping episode {episode} due to invalid data")
+            continue
+        xs, xq = episode_data['xs'].to(device), episode_data['xq'].to(device)
+        ys, yq = episode_data['ys'].to(device), episode_data['yq'].to(device)
+        support_patches = episode_data['support_patches']
+        query_patches = episode_data['query_patches']
+        original_classes = episode_data['original_classes']
+        episode_idx_to_original_label = episode_data['episode_idx_to_original_label_map']
+
+        for label in original_classes:
+            if label in DAMAGE_LABELS.values():
+                episode_class_counts[label] += 1
+            else:
+                logging.warning(f"Invalid class label {label} in episode {episode}")
+
+        start_time = time.time()
+        with torch.no_grad():
+            support_features = model(xs)
+            query_features = model(xq)
+            prototypes = model.calculate_prototypes(support_features, ys)
+            distances = model.compute_distances(query_features, prototypes)
+            _, predicted = torch.min(distances, 1)
+        inference_time = time.time() - start_time
+        inference_times.append(inference_time)
+
+        accuracy = (predicted == yq).float().mean().item()
+        all_accuracies.append(accuracy)
+
+        for i in range(xq.size(0)):
+            global_image_count += 1
+            query_input = xq[i:i + 1].requires_grad_(True)
+            heatmap = model.compute_gradcam(query_input, predicted[i].item(), device=device)
+            all_heatmaps.append(heatmap)
+            heatmap_var = np.var(heatmap)
+            heatmap_variances.append(heatmap_var)
+            pre_patch, post_patch = query_patches[i]
+            true_original_label_viz = episode_idx_to_original_label.get(yq[i].item(), -1)
+            pred_original_label_viz = episode_idx_to_original_label.get(predicted[i].item(), -1)
+            if global_image_count % 50 == 0 and true_original_label_viz in DAMAGE_LABELS.values() and pred_original_label_viz in DAMAGE_LABELS.values():
+                save_visualization(heatmap, pre_patch, f'ep{episode}_query{i}_pre.png', true_original_label_viz,
+                                   pred_original_label_viz, is_pre=True)
+                save_visualization(heatmap, post_patch, f'ep{episode}_query{i}_post.png', true_original_label_viz,
+                                   pred_original_label_viz, is_pre=False)
+
+        with torch.no_grad():
+            for label in torch.unique(ys):
+                mask = (ys == label)
+                class_features = support_features[mask]
+                if class_features.size(0) == 0:
+                    continue
+                proto = prototypes[label]
+                dists = torch.sqrt(torch.sum((class_features - proto) ** 2, dim=1)).cpu().numpy()
+                original_label = episode_idx_to_original_label.get(label.item(), -1)
+                if original_label not in DAMAGE_LABELS.values():
+                    logging.warning(f"Invalid original label {original_label} for episode label {label} in episode {episode}")
+                    continue
+                prototype_distances[original_label].extend(dists.tolist())
+
+            proto_patches = model.get_prototype_patches(support_features, ys, support_patches, num_top=3)
+            for label, patches in proto_patches.items():
+                for j, (pre_patch, post_patch) in enumerate(patches):
+                    plt.figure(figsize=(6, 6))
+                    plt.imshow(np.array(post_patch.convert('RGB')) / 255.0)
+                    plt.title(f"Prototype Patch for {get_damage_name(label)}")
+                    plt.axis('off')
+                    plt.savefig(os.path.join(vis_dir, f'ep{episode}_proto_label{label}_patch{j}.png'), bbox_inches='tight')
+                    plt.close()
+                all_prototype_patches.append((label, patches))
+
+            unique_classes = list(dict.fromkeys(original_classes))
+            episode_to_original_label = {i: orig_label for i, orig_label in enumerate(unique_classes)}
+            for i in range(len(yq)):
+                true_episode_label = yq[i].item()
+                pred_episode_label = predicted[i].item()
+                true_original_label = episode_to_original_label.get(true_episode_label, -1)
+                pred_original_label = episode_to_original_label.get(pred_episode_label, -1)
+                if pred_original_label == -1 or true_original_label == -1:
+                    logging.warning(f"Invalid label mapping in episode {episode}: true={true_episode_label}, pred={pred_episode_label}")
+                    continue
+                class_total_counts[true_original_label] += 1
+                if pred_episode_label == true_episode_label:
+                    class_correct_counts[true_original_label] += 1
+                all_true_labels.append(true_original_label)
+                all_pred_labels.append(pred_original_label)
+                episode_confusion_counts[true_original_label][pred_original_label] += 1
+
+        logging.info(f"Episode {episode} Confusion: "
+                     f"{[f'True {get_damage_name(t)} -> {dict(c)}' for t, c in episode_confusion_counts.items() if c]}")
+
+    logging.info(f"Evaluation Class Frequencies: {dict(episode_class_counts)}")
+    overall_accuracy = np.mean(all_accuracies) if all_accuracies else 0.0
+    avg_inference_time = np.mean(inference_times) if inference_times else 0.0
+    class_accuracies = {label: class_correct_counts[label] / class_total_counts[label] if class_total_counts[label] > 0 else 0.0
+                        for label in DAMAGE_LABELS.values()}
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        all_true_labels, all_pred_labels, labels=list(DAMAGE_LABELS.values()), average=None, zero_division=0
+    )
+    macro_precision = np.mean(precision)
+    macro_recall = np.mean(recall)
+    macro_f1 = np.mean(f1)
+    cm = confusion_matrix(all_true_labels, all_pred_labels, labels=list(DAMAGE_LABELS.values()))
+
+    if all_true_labels:
+        accuracies = []
+        for _ in range(1000):
+            boot_true, boot_pred = resample(all_true_labels, all_pred_labels)
+            acc = accuracy_score(boot_true, boot_pred)
+            accuracies.append(acc)
+        acc_ci = np.percentile(accuracies, [2.5, 97.5])
+        logging.info(f"95% CI for accuracy: {acc_ci}")
+    else:
+        acc_ci = [0.0, 0.0]
+
+    class_metrics = {
+        label: {
+            'accuracy': class_accuracies[label],
+            'precision': precision[idx],
+            'recall': recall[idx],
+            'f1': f1[idx],
+            'support': support[idx]
+        }
+        for idx, label in enumerate(DAMAGE_LABELS.values())
+    }
+
+    avg_heatmap_variance = np.mean(heatmap_variances) if heatmap_variances else 0.0
+    prototype_distance_stats = {
+        label: {
+            'mean': np.mean(dists) if dists else 0.0,
+            'std': np.std(dists) if dists else 0.0
+        }
+        for label, dists in prototype_distances.items()
+    }
+
+    return {
+        'overall_accuracy': overall_accuracy,
+        'avg_inference_time': avg_inference_time,
+        'class_accuracies': class_accuracies,
+        'class_metrics': class_metrics,
+        'macro_precision': macro_precision,
+        'macro_recall': macro_recall,
+        'macro_f1': macro_f1,
+        'confusion_matrix': cm.tolist(),
+        'heatmaps': all_heatmaps,
+        'prototype_patches': all_prototype_patches,
+        'heatmap_variance': avg_heatmap_variance,
+        'prototype_distances': prototype_distance_stats,
+        'class_frequencies': dict(episode_class_counts),
+        'accuracy_ci': acc_ci
+    }
+
+# --- Ablation Study ---
+def run_ablation_study(model, dataset, num_episodes=100, n_way=3, k_shot=10, q_query=5, device='cpu', class_counts=None,
+                       vis_dir='visualizations'):
+    logging.info("Evaluating SE-enhanced ProtoNet...")
+    se_results = evaluate_model(model, dataset, num_episodes, n_way, k_shot, q_query, device, class_counts,
+                                start_episode=1, vis_dir=vis_dir)
+
+    class BaselineProtoNet(nn.Module):
+        def __init__(self, input_channels=6, feature_dim=64):
+            super(BaselineProtoNet, self).__init__()
+            self.encoder = nn.Sequential(
+                nn.Conv2d(input_channels, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(64, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(64, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(64, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.Dropout(0.5)
+            )
+            self.adaptive_pool = nn.AdaptiveAvgPool2d((8, 8))
+            self.fc = nn.Linear(64 * 8 * 8, feature_dim)
+            self.feature_dim = feature_dim
+            self.last_conv = self.encoder[12]
+            self.gradients = None
+            self.activations = None
+
+        def save_gradient(self, grad):
+            self.gradients = grad
+
+        def forward(self, x, return_features=False):
+            feature_maps = self.encoder(x)
+            pooled_features = self.adaptive_pool(feature_maps)
+            features = pooled_features.view(pooled_features.size(0), -1)
+            features = self.fc(features)
+            if return_features:
+                return features, feature_maps
+            return features
+
+        def calculate_prototypes(self, features, labels):
+            unique_labels = torch.unique(labels)
+            feature_dim = features.shape[1]
+            device = features.device
+            prototype_list = []
+            for label_val_tensor in unique_labels:
+                label_val = label_val_tensor.item()
+                mask = (labels == label_val_tensor)
+                class_features = features[mask]
+                if class_features.shape[0] == 0:
+                    logging.warning(f"Empty class for label {label_val} in prototype calculation")
+                    prototype_list.append(torch.zeros(feature_dim, device=device, requires_grad=False))
+                    continue
+                prototype = class_features.mean(dim=0)
+                prototype_list.append(prototype)
+            if not prototype_list:
+                raise ValueError("No prototypes computed; all classes in support set were empty.")
+            return torch.stack(prototype_list, dim=0)
+
+        def compute_distances(self, query_features, prototypes):
+            diff = query_features.unsqueeze(1) - prototypes.unsqueeze(0)
+            distances = torch.sum(diff ** 2, dim=2)
+            return distances
+
+        def compute_gradcam(self, x, target_class, device='cpu'):
+            was_training = self.training
+            self.eval()
+            x = x.to(device)
+            x.requires_grad_(True)
+            self.gradients = None
+            self.activations = None
+
+            def forward_hook(module, input, output):
+                self.activations = output
+
+            def backward_hook(module, grad_input, grad_output):
+                self.gradients = grad_output[0]
+
+            forward_handle = self.last_conv.register_forward_hook(forward_hook)
+            backward_handle = self.last_conv.register_backward_hook(backward_hook)
+
+            try:
+                features, _ = self.forward(x, return_features=True)
+                self.zero_grad()
+                score = features[0, target_class]
+                score.backward()
+                if self.gradients is None or self.activations is None:
+                    logging.warning("Gradients or activations not captured")
+                    return np.zeros((x.size(2), x.size(3)))
+                pooled_gradients = torch.mean(self.gradients, dim=[2, 3])
+                for i in range(self.activations.size(1)):
+                    self.activations[0, i] *= pooled_gradients[0, i]
+                heatmap = torch.mean(self.activations[0], dim=0)
+                heatmap = F.relu(heatmap)
+                heatmap /= torch.max(heatmap) + 1e-8
+                heatmap = heatmap.detach().cpu().numpy()
+            except Exception as e:
+                logging.error(f"Grad-CAM failed: {str(e)}")
+                heatmap = np.zeros((x.size(2), x.size(3)))
+            finally:
+                forward_handle.remove()
+                backward_handle.remove()
+            if was_training:
+                self.train()
+            return heatmap
+
+        def get_prototype_patches(self, support_features, support_labels, support_patches, num_top=3):
+            prototypes = self.calculate_prototypes(support_features, support_labels)
+            prototype_patches = {label.item(): [] for label in torch.unique(support_labels)}
+            for i, label in enumerate(torch.unique(support_labels)):
+                label_val = label.item()
+                mask = (support_labels == label)
+                class_features = support_features[mask]
+                class_patches = [support_patches[j] for j in range(len(support_patches)) if mask[j]]
+                if len(class_features) == 0:
+                    continue
+                prototype = prototypes[i]
+                distances = torch.sum((class_features - prototype) ** 2, dim=1)
+                _, top_indices = torch.topk(distances, k=min(num_top, len(distances)), largest=False)
+                prototype_patches[label_val] = [class_patches[j] for j in top_indices]
+            return prototype_patches
+
+    baseline_model = BaselineProtoNet(input_channels=6, feature_dim=64).to(device)
+    model_dict = model.state_dict()
+    baseline_dict = baseline_model.state_dict()
+    se_to_baseline_mapping = {
+        'encoder.0.weight': 'encoder.0.weight',
+        'encoder.0.bias': 'encoder.0.bias',
+        'encoder.5.weight': 'encoder.4.weight',
+        'encoder.5.bias': 'encoder.4.bias',
+        'encoder.10.weight': 'encoder.8.weight',
+        'encoder.10.bias': 'encoder.8.bias',
+        'encoder.15.weight': 'encoder.12.weight',
+        'encoder.15.bias': 'encoder.12.bias',
+        'encoder.1.weight': 'encoder.1.weight',
+        'encoder.1.bias': 'encoder.1.bias',
+        'encoder.1.running_mean': 'encoder.1.running_mean',
+        'encoder.1.running_var': 'encoder.1.running_var',
+        'encoder.6.weight': 'encoder.5.weight',
+        'encoder.6.bias': 'encoder.5.bias',
+        'encoder.6.running_mean': 'encoder.5.running_mean',
+        'encoder.6.running_var': 'encoder.5.running_var',
+        'encoder.11.weight': 'encoder.9.weight',
+        'encoder.11.bias': 'encoder.9.bias',
+        'encoder.11.running_mean': 'encoder.9.running_mean',
+        'encoder.11.running_var': 'encoder.9.running_var',
+        'encoder.16.weight': 'encoder.13.weight',
+        'encoder.16.bias': 'encoder.13.bias',
+        'encoder.16.running_mean': 'encoder.13.running_mean',
+        'encoder.16.running_var': 'encoder.13.running_var',
+        'fc.weight': 'fc.weight',
+        'fc.bias': 'fc.bias'
+    }
+    for se_key, baseline_key in se_to_baseline_mapping.items():
+        if se_key in model_dict and baseline_key in baseline_dict:
+            baseline_dict[baseline_key].copy_(model_dict[se_key])
+    baseline_model.load_state_dict(baseline_dict)
+
+    logging.info("Evaluating baseline ProtoNet (no SE blocks)...")
+    baseline_results = evaluate_model(baseline_model, dataset, num_episodes, n_way, k_shot, q_query, device,
+                                      class_counts, start_episode=num_episodes + 1, vis_dir=vis_dir)
+    return {
+        'se_results': se_results,
+        'baseline_results': baseline_results
+    }
+
 def get_damage_name(label_id: int) -> str:
     for name, id_val in DAMAGE_LABELS.items():
         if id_val == label_id:
             return name.replace('-', ' ').title()
     return f"Unknown ({label_id})"
 
-
-def load_trained_model(model_class: type, model_path: str, input_channels: int, hidden_dim: int, device: str,
-                       num_scales: int = 2) -> Optional[ProtoNetEnhanced]:
-    model = model_class(input_channels=input_channels, hidden_dim=hidden_dim, num_scales=num_scales)
-    try:
-        print(f"Attempting to load checkpoint from {model_path}...")
-        # Check if file exists and is accessible
-        import os
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Checkpoint file does not exist: {model_path}")
-        if not os.path.isfile(model_path):
-            raise ValueError(f"Path is not a file: {model_path}")
-
-        # Try loading with weights_only=False to inspect the content
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        print(f"Checkpoint type: {type(checkpoint)}")
-        print(f"Checkpoint content: {checkpoint if isinstance(checkpoint, dict) else str(checkpoint)[:100]}...")
-
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-            print("Found 'model_state_dict' in checkpoint.")
-        elif isinstance(checkpoint, dict):
-            state_dict = checkpoint
-            print("Treating checkpoint as state dict directly.")
-        else:
-            raise ValueError(f"Unexpected checkpoint format: {type(checkpoint)}. Expected a dict or state dict.")
-
-        if not isinstance(state_dict, dict):
-            raise ValueError(f"State dict is not a dictionary: {type(state_dict)}")
-        print(f"State dict keys: {list(state_dict.keys())[:5]}...")
-
-        model.load_state_dict(state_dict)
-        model.to(device)
-        model.eval()
-        print(f"Model loaded successfully from {model_path}")
-        return model
-    except FileNotFoundError as e:
-        print(f"Error: Model file not found at {model_path}: {e}")
-        return None
-    except Exception as e:
-        print(f"Error loading model state_dict from {model_path}: {e}")
-        return None
-
-
-def get_prediction_support_set(train_dataset: XBDPatchDatasetEnhanced, k_shot: int, device: str) -> Tuple[
-    Optional[List[torch.Tensor]], Optional[torch.Tensor], Optional[List[int]]]:
-    support_images = []
-    support_episode_labels = []
-    original_class_order = sorted(list(DAMAGE_LABELS.values()))
-    n_way = len(original_class_order)
-
-    print(f"Attempting to sample {k_shot}-shot support set for {n_way} classes...")
-
-    for i, original_label in enumerate(original_class_order):
-        episode_label = i
-        class_patches_info = train_dataset.patches_by_class.get(original_label, [])
-        num_available = len(class_patches_info)
-
-        if num_available == 0:
-            print(
-                f"FATAL ERROR: No training patches found for class {original_label} ({get_damage_name(original_label)}). Cannot build support set.")
-            return None, None, None
-
-        if num_available < k_shot:
-            print(
-                f"Warning: Class {original_label} ({get_damage_name(original_label)}) only has {num_available} training samples (need {k_shot}). Sampling with replacement.")
-            selected_patches_info = random.choices(class_patches_info, k=k_shot)
-        else:
-            selected_patches_info = random.sample(class_patches_info, k=k_shot)
-
-        loaded_count = 0
-        for patch_info in selected_patches_info:
-            try:
-                idx = train_dataset.patches.index(patch_info)
-                combined, _, _ = train_dataset[idx]
-                support_images.append(combined)
-                support_episode_labels.append(episode_label)
-                loaded_count += 1
-            except Exception as e:
-                print(f"Error loading support patch {patch_info}: {e}. Skipping.")
-
-        if loaded_count != k_shot:
-            print(f"Warning: Loaded only {loaded_count}/{k_shot} support samples for class {original_label}.")
-            if loaded_count == 0:
-                print(f"FATAL ERROR: Failed to load any support samples for class {original_label}.")
-                return None, None, None
-
-    if not support_images or len(support_episode_labels) != n_way * k_shot:
-        print(
-            f"Error: Failed to load the required number of support images ({len(support_images)} loaded, expected {n_way * k_shot}). Cannot proceed.")
-        return None, None, None
-
-    support_images_tensors = [torch.stack([img[i] for img in support_images]).to(device) for i in
-                              range(len(train_dataset.patch_sizes))]
-    support_labels_tensor = torch.tensor(support_episode_labels, dtype=torch.long).to(device)
-
-    print(f"Successfully created support set with shapes: {[t.shape for t in support_images_tensors]}")
-    return support_images_tensors, support_labels_tensor, original_class_order
-
-
-def visualize_predictions(model: ProtoNetEnhanced, vis_dataset: XBDPatchDatasetEnhanced,
-                          train_dataset: XBDPatchDatasetEnhanced, k_shot: int,
-                          num_samples: int = 10, device: str = 'cpu') -> None:
-    if not model:
-        print("Model not provided or loaded. Cannot visualize predictions.")
-        return
-    if not vis_dataset or len(vis_dataset) == 0:
-        print("Visualization dataset is empty or not provided. Cannot visualize.")
-        return
-    if not train_dataset or len(train_dataset) == 0:
-        print("Training dataset for support set is empty or not provided. Cannot visualize.")
-        return
-
-    model.eval()
-    model.to(device)
-
-    print("\n--- Visualizing Predictions ---")
-    print(f"Attempting to generate {num_samples} visualizations...")
-
-    num_to_vis = min(num_samples, len(vis_dataset))
-    if num_to_vis == 0:
-        print("No samples available in the visualization dataset.")
-        return
-
-    print("Generating support set for predictions...")
-    support_images, support_labels, class_order = get_prediction_support_set(train_dataset, k_shot, device)
-
-    if support_images is None:
-        print("Failed to create support set. Aborting visualization.")
-        return
-    if len(class_order) != len(DAMAGE_LABELS):
-        print(
-            f"Warning: Support set only contains prototypes for {len(class_order)}/{len(DAMAGE_LABELS)} classes. Predictions limited.")
-
-    try:
-        with torch.no_grad():
-            support_features = model(support_images)
-            if support_features.shape[0] != support_labels.shape[0]:
-                raise ValueError(
-                    f"Support features ({support_features.shape[0]}) and labels ({support_labels.shape[0]}) count mismatch.")
-            prototypes = model.calculate_prototypes(support_features, support_labels)
-            print(f"Prototypes calculated for {prototypes.shape[0]} classes.")
-    except Exception as e:
-        print(f"Error calculating prototypes: {e}. Aborting visualization.")
-        return
-
-    vis_indices = random.sample(range(len(vis_dataset)), num_to_vis)
-    print(f"Selected {len(vis_indices)} indices to visualize.")
-
-    successful_visualizations = 0
-    for i, idx in enumerate(vis_indices):
-        print(f"\nProcessing sample {i + 1}/{len(vis_indices)} (Index: {idx})")
-        try:
-            query_tensors, true_label, metadata = vis_dataset[idx]
-            query_tensors = [t.to(device).unsqueeze(0) for t in query_tensors]
-
-            pre_img_orig = Image.open(metadata['pre_path']).convert('RGB')
-            post_img_orig = Image.open(metadata['post_path']).convert('RGB')
-            coords = metadata['coords'][128]  # Use 128x128 for visualization
-            if not (isinstance(coords, tuple) and len(coords) == 4 and all(isinstance(c, int) for c in coords)):
-                print(f"Error: Invalid coordinates format in metadata for index {idx}: {coords}. Skipping.")
-                continue
-            pre_patch_orig = pre_img_orig.crop(coords)
-            post_patch_orig = post_img_orig.crop(coords)
-
-            with torch.no_grad():
-                query_features = model(query_tensors)
-                distances = model.compute_distances(query_features, prototypes)
-                if distances.numel() == 0 or distances.shape[1] != prototypes.shape[0]:
-                    print(
-                        f"Error: Distance calculation failed or resulted in unexpected shape {distances.shape} (expected [1, {prototypes.shape[0]}]). Skipping.")
-                    continue
-                pred_index = torch.argmin(distances, dim=1).item()
-
-            predicted_label = class_order[pred_index] if pred_index < len(class_order) else -1
-            true_name = get_damage_name(true_label)
-            pred_name = get_damage_name(predicted_label) if predicted_label != -1 else "Prediction Error"
-
-            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-            fig.patch.set_facecolor('white')
-
-            axes[0].imshow(pre_patch_orig)
-            axes[0].set_title("Pre-Disaster Patch")
-            axes[0].axis('off')
-
-            axes[1].imshow(post_patch_orig)
-            axes[1].set_title("Post-Disaster Patch")
-            axes[1].axis('off')
-
-            correct = (true_label == predicted_label)
-            title_color = 'green' if correct else 'red'
-            if predicted_label == -1:
-                title_color = 'black'
-
-            fig.suptitle(f'Sample {i + 1} - Index: {idx}\nPrediction: {pred_name} (True: {true_name})',
-                         fontsize=14, color=title_color, y=0.98)
-
-            plt.tight_layout(rect=[0, 0.03, 1, 0.92])
-            save_path = f'prediction_visualization_sample{i + 1}_idx{idx}.png'
-            plt.savefig(save_path)
-            print(f"Saved visualization to {save_path}")
-            plt.close(fig)
-            successful_visualizations += 1
-
-        except Exception as e:
-            print(f"Error visualizing index {idx}: {e}. Skipping.")
-            plt.close('all')
-
-    print(
-        f"\nFinished visualization attempts. Successfully generated {successful_visualizations}/{len(vis_indices)} images.")
-
-
-# --- Training Function ---
-def train_protonet_with_patches(model: ProtoNetEnhanced, train_dataset: XBDPatchDatasetEnhanced,
-                                val_dataset: Optional[XBDPatchDatasetEnhanced],
-                                n_way: int, k_shot: int, q_query: int,
-                                num_episodes: int = 200, learning_rate: float = 0.001,
-                                val_interval: int = 100, early_stopping_patience: Optional[int] = None,
-                                device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> ProtoNetEnhanced:
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, num_episodes // 5), gamma=0.5)
-    best_val_acc = -1.0
-    best_model_state = None
-    epochs_without_improvement = 0
-    train_losses = []
-    train_accuracies = []
-    print(f"Starting training on {device} for {num_episodes} episodes...")
-    print(f"N-way={n_way}, K-shot={k_shot}, Q-query={q_query}")
-    if val_dataset:
-        print(f"Validation every {val_interval} episodes.")
-    if early_stopping_patience:
-        print(f"Early stopping patience: {early_stopping_patience}.")
-
-    for episode in range(num_episodes):
-        model.train()
-        optimizer.zero_grad()
-        try:
-            episode_data = train_dataset.sample_episode(n_way, k_shot, q_query)
-            xs, xq = episode_data['xs'], episode_data['xq']
-            ys, yq = episode_data['ys'].to(device), episode_data['yq'].to(device)
-            xs = [x.to(device) for x in xs]
-            xq = [x.to(device) for x in xq]
-            if any(x.shape[0] == 0 for x in xs) or any(x.shape[0] == 0 for x in xq):
-                raise ValueError("Empty support or query set")
-        except ValueError as e:
-            print(f"Error sampling train episode {episode + 1}: {e}. Skipping.")
-            scheduler.step()
-            continue
-        except Exception as e:
-            print(f"Unexpected error sampling train episode {episode + 1}: {e}. Skipping.")
-            scheduler.step()
-            continue
-
-        try:
-            print(f"Episode {episode + 1}: xs shapes: {[x.shape for x in xs]}")
-            support_features = model(xs)
-            print(f"Episode {episode + 1}: support_features shape: {support_features.shape}")
-            query_features = model(xq)
-            print(f"Episode {episode + 1}: query_features shape: {query_features.shape}")
-            prototypes = model.calculate_prototypes(support_features, ys)
-            print(f"Episode {episode + 1}: prototypes shape: {prototypes.shape}")
-            distances = model.compute_distances(query_features, prototypes)
-            print(f"Episode {episode + 1}: distances shape: {distances.shape}")
-            log_p_y = F.log_softmax(-distances, dim=1)
-            print(f"Episode {episode + 1}: log_p_y shape: {log_p_y.shape}")
-            loss = F.nll_loss(log_p_y, yq)
-            print(f"Episode {episode + 1}: loss: {loss.item()}")
-            loss.backward()
-            optimizer.step()
-
-            with torch.no_grad():
-                _, predicted_labels = torch.min(distances, 1)
-                comparison = (predicted_labels == yq)
-                accuracy = comparison.float().mean().item()
-            train_losses.append(loss.item())
-            train_accuracies.append(accuracy)
-        except Exception as e:
-            print(f"Error during training forward/backward pass episode {episode + 1}: {e}. Skipping update.")
-            optimizer.zero_grad()
-            continue
-
-        scheduler.step()
-
-        if (episode + 1) % 100 == 0:
-            print(
-                f"Episode {episode + 1}/{num_episodes}: Loss = {loss.item():.4f}, Acc = {accuracy:.4f}, LR = {scheduler.get_last_lr()[0]:.6f}")
-
-        if val_dataset is not None and (episode + 1) % val_interval == 0:
-            print(f"\n--- Running Validation @ Episode {episode + 1} ---")
-            try:
-                val_results = evaluate_model(model, val_dataset, num_episodes=100, n_way=n_way, k_shot=k_shot,
-                                             q_query=q_query, device=device, eval_mode='validation')
-                val_acc = val_results['overall_accuracy']
-                print(f"--- Validation Accuracy: {val_acc:.4f} ---")
-                if val_acc > best_val_acc:
-                    print(f"Val accuracy improved ({best_val_acc:.4f} -> {val_acc:.4f}). Saving checkpoint.")
-                    best_val_acc = val_acc
-                    best_model_state = copy.deepcopy(model.state_dict())
-                    epochs_without_improvement = 0
-                    checkpoint_path = f'protonet_best_val_ep{episode + 1}_acc{val_acc:.4f}.pth'
-                    checkpoint_dict = {
-                        'episode': episode + 1,
-                        'model_state_dict': best_model_state,
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'best_val_accuracy': best_val_acc,
-                        'n_way': n_way,
-                        'k_shot': k_shot
-                    }
-                    torch.save(checkpoint_dict, checkpoint_path)
-                    print(f"Checkpoint saved to {checkpoint_path}")
-                    try:
-                        saved_checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-                        print(f"Verified saved checkpoint: {list(saved_checkpoint.keys())}")
-                    except Exception as e:
-                        print(f"Warning: Failed to verify saved checkpoint {checkpoint_path}: {e}")
-                else:
-                    epochs_without_improvement += 1
-                    print(
-                        f"Val accuracy did not improve ({val_acc:.4f}). ({epochs_without_improvement}/{early_stopping_patience if early_stopping_patience else 'inf'})")
-                if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
-                    print(f"\nEarly stopping triggered after {epochs_without_improvement} checks.")
-                    break
-            except Exception as e:
-                print(f"Error during validation @ episode {episode + 1}: {e}")
-
-    # Plot training curves
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Training Loss', color='blue')
-    plt.xlabel('Episode')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Curve')
-    plt.subplot(1, 2, 2)
-    plt.plot(train_accuracies, label='Training Accuracy', color='orange')
-    plt.xlabel('Episode')
-    plt.ylabel('Accuracy')
-    plt.title('Training Accuracy Curve')
-    plt.tight_layout()
-    plt.savefig('training_curves.png')
-    print("Saved training curves to training_curves.png")
-    plt.close()
-
-    print("\nTraining finished.")
-    if best_model_state is not None:
-        print(f"Loading best model from validation (Acc: {best_val_acc:.4f})")
-        model.load_state_dict(best_model_state)
-    else:
-        print("Warning: No best model state saved. Using final model state.")
-    return model
-
-
-# --- Evaluation Function ---
-def evaluate_model(model: ProtoNetEnhanced, dataset: XBDPatchDatasetEnhanced, num_episodes: int = 100,
-                   n_way: int = 4, k_shot: int = 5, q_query: int = 10,
-                   device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-                   eval_mode: str = 'test') -> Dict:
-    model.eval()
-    all_accuracies = []
-    class_correct_counts = {label: 0 for label in DAMAGE_LABELS.values()}
-    class_total_counts = {label: 0 for label in DAMAGE_LABELS.values()}
-    class_true_positives = {label: 0 for label in DAMAGE_LABELS.values()}
-    class_predicted_counts = {label: 0 for label in DAMAGE_LABELS.values()}
-    confusion_matrix = np.zeros((n_way, n_way))
-    print(f"Starting {eval_mode} evaluation ({dataset.split_name}) with {num_episodes} episodes...")
-
-    for episode in tqdm(range(num_episodes), desc=f"Evaluating ({eval_mode} - {dataset.split_name})"):
-        with torch.no_grad():
-            try:
-                episode_data = dataset.sample_episode(n_way, k_shot, q_query)
-                xs, xq = episode_data['xs'], episode_data['xq']
-                ys, yq = episode_data['ys'].to(device), episode_data['yq'].to(device)
-                xs = [x.to(device) for x in xs]
-                xq = [x.to(device) for x in xq]
-                original_classes = episode_data['original_classes']
-                if any(x.shape[0] == 0 for x in xs) or any(x.shape[0] == 0 for x in xq):
-                    raise ValueError("Empty support or query set")
-            except ValueError as e:
-                print(f"Error sampling eval episode {episode + 1} ({eval_mode}): {e}. Skipping.")
-                continue
-            except Exception as e:
-                print(f"Unexpected error sampling eval episode {episode + 1} ({eval_mode}): {e}. Skipping.")
-                continue
-
-            try:
-                support_features = model(xs)
-                query_features = model(xq)
-                prototypes = model.calculate_prototypes(support_features, ys)
-                distances = model.compute_distances(query_features, prototypes)
-                _, predicted_episode_labels = torch.min(distances, 1)
-
-                comparison = (predicted_episode_labels == yq)
-                accuracy = comparison.float().mean().item()
-                all_accuracies.append(accuracy)
-
-                episode_to_original_label = {i: orig_label for i, orig_label in enumerate(original_classes)}
-                for i in range(len(yq)):
-                    true_episode_label = yq[i].item()
-                    pred_episode_label = predicted_episode_labels[i].item()
-                    if true_episode_label not in episode_to_original_label:
-                        continue
-                    true_original_label = episode_to_original_label[true_episode_label]
-                    pred_original_label = episode_to_original_label.get(pred_episode_label, -1)
-                    if pred_original_label == -1:
-                        continue
-                    class_total_counts[true_original_label] += 1
-                    class_predicted_counts[pred_original_label] += 1
-                    if pred_episode_label == true_episode_label:
-                        class_correct_counts[true_original_label] += 1
-                        class_true_positives[true_original_label] += 1
-                    if 0 <= pred_episode_label < n_way and 0 <= true_episode_label < n_way:
-                        confusion_matrix[true_episode_label, pred_episode_label] += 1
-                    else:
-                        print(
-                            f"Warning: Invalid episode label detected in evaluation. True: {true_episode_label}, Pred: {pred_episode_label}. Max expected: {n_way - 1}")
-            except Exception as e:
-                print(f"Error during evaluation forward pass episode {episode + 1} ({eval_mode}): {e}. Skipping episode.")
-                continue
-
-    overall_accuracy_mean = np.mean(all_accuracies) if all_accuracies else 0.0
-    overall_accuracy_std = np.std(all_accuracies) if all_accuracies else 0.0
-    class_accuracies = {}
-    class_f1_scores = {}
-    class_precision = {}
-    class_recall = {}
-    valid_original_classes = []
-    for label in DAMAGE_LABELS.values():
-        if class_total_counts[label] > 0:
-            acc = class_correct_counts[label] / class_total_counts[label]
-            precision = class_true_positives[label] / class_predicted_counts[label] if class_predicted_counts[label] > 0 else 0.0
-            recall = class_true_positives[label] / class_total_counts[label] if class_total_counts[label] > 0 else 0.0
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            class_accuracies[label] = acc
-            class_f1_scores[label] = f1
-            class_precision[label] = precision
-            class_recall[label] = recall
-            valid_original_classes.append(label)
-
-    macro_f1 = np.mean(list(class_f1_scores.values())) if class_f1_scores else 0.0
-    row_sums = confusion_matrix.sum(axis=1, keepdims=True)
-    normalized_cm = np.divide(confusion_matrix, row_sums, out=np.zeros_like(confusion_matrix), where=row_sums != 0)
-
-    results = {
-        'overall_accuracy': overall_accuracy_mean,
-        'overall_accuracy_std': overall_accuracy_std,
-        'class_accuracies': class_accuracies,
-        'class_f1_scores': class_f1_scores,
-        'class_precision': class_precision,
-        'class_recall': class_recall,
-        'macro_f1': macro_f1,
-        'confusion_matrix': normalized_cm,
-        'evaluated_original_classes': sorted(valid_original_classes),
-        'n_way_evaluated': n_way,
-        'all_accuracies': all_accuracies  # For episode-wise distribution
-    }
-    print(f"Evaluation finished ({eval_mode}). Overall Accuracy: {overall_accuracy_mean:.4f} +/- {overall_accuracy_std:.4f}")
-    print(f"Macro-Averaged F1-Score: {macro_f1:.4f}")
-    return results
-
-
-# --- Results Visualization Function ---
-def visualize_results(results: Dict, prefix: str = "") -> None:
-    damage_names = {1: "No Damage", 2: "Minor", 3: "Major", 4: "Destroyed"}
-    print(f"\n--- {prefix} Evaluation Results ---")
-    print(f"Overall Accuracy: {results['overall_accuracy']:.4f} (std: {results['overall_accuracy_std']:.4f})")
-    print(f"Macro-Averaged F1-Score: {results['macro_f1']:.4f}")
-    class_accuracies = results['class_accuracies']
-    class_f1_scores = results['class_f1_scores']
-    class_precision = results['class_precision']
-    class_recall = results['class_recall']
-    evaluated_original_classes = results['evaluated_original_classes']
-    if not evaluated_original_classes:
-        print("No classes evaluated, skipping plots.")
-        return
-
-    plot_labels = [damage_names.get(label, f"Class {label}") for label in evaluated_original_classes]
-    plot_accuracies = [class_accuracies[label] for label in evaluated_original_classes]
-    plot_f1_scores = [class_f1_scores[label] for label in evaluated_original_classes]
-    plot_precision = [class_precision[label] for label in evaluated_original_classes]
-    plot_recall = [class_recall[label] for label in evaluated_original_classes]
-
-    # Print per-class metrics
-    print("Per-Class Metrics:")
-    for label, acc, f1, prec, rec in zip(plot_labels, plot_accuracies, plot_f1_scores, plot_precision, plot_recall):
-        print(f"  {label}: Accuracy={acc:.4f}, F1-Score={f1:.4f}, Precision={prec:.4f}, Recall={rec:.4f}")
-
-    # Plot per-class accuracies
-    plt.figure(figsize=(8, 5))
-    bars = plt.bar(plot_labels, plot_accuracies, color='skyblue')
-    plt.ylabel('Accuracy')
-    plt.title(f'{prefix} Per-Class Accuracy')
-    plt.ylim(0, 1.05)
-    plt.xticks(rotation=45, ha='right')
-    for bar in bars:
-        y_value = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2.0, y_value + 0.01, f'{y_value:.2f}', va='bottom', ha='center')
-    plt.tight_layout()
-    plt.savefig(f'{prefix}_class_accuracies.png')
-    print(f"Saved per-class accuracy plot to {prefix}_class_accuracies.png")
-    plt.close()
-
-    # Plot per-class F1-scores
-    plt.figure(figsize=(8, 5))
-    bars = plt.bar(plot_labels, plot_f1_scores, color='lightcoral')
-    plt.ylabel('F1-Score')
-    plt.title(f'{prefix} Per-Class F1-Score')
-    plt.ylim(0, 1.05)
-    plt.xticks(rotation=45, ha='right')
-    for bar in bars:
-        y_value = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2.0, y_value + 0.01, f'{y_value:.2f}', va='bottom', ha='center')
-    plt.tight_layout()
-    plt.savefig(f'{prefix}_class_f1_scores.png')
-    print(f"Saved per-class F1-score plot to {prefix}_class_f1_scores.png")
-    plt.close()
-
-    # Plot episode-wise accuracy distribution
-    all_accuracies = results['all_accuracies']
-    if all_accuracies:
-        plt.figure(figsize=(8, 5))
-        plt.hist(all_accuracies, bins=20, color='skyblue', edgecolor='black')
-        plt.xlabel('Episode Accuracy')
-        plt.ylabel('Frequency')
-        plt.title(f'{prefix} Episode-Wise Accuracy Distribution')
-        plt.tight_layout()
-        plt.savefig(f'{prefix}_accuracy_distribution.png')
-        print(f"Saved accuracy distribution plot to {prefix}_accuracy_distribution.png")
-        plt.close()
-
-    # Plot confusion matrix
-    confusion_matrix = results['confusion_matrix']
-    n_way = results['n_way_evaluated']
-    cm_labels = [f"Cls {i}" for i in range(n_way)]
-    if confusion_matrix.size == 0 or n_way == 0:
-        return
-    plt.figure(figsize=(7, 6))
-    plt.imshow(confusion_matrix, interpolation='nearest', cmap=plt.cm.Blues, vmin=0, vmax=1)
-    plt.title(f'{prefix} Avg. Norm. Confusion Matrix ({n_way}-way)')
-    plt.colorbar(label='Normalized Frequency')
-    tick_marks = np.arange(len(cm_labels))
-    plt.xticks(tick_marks, cm_labels, rotation=45, ha='right')
-    plt.yticks(tick_marks, cm_labels)
-    thresh = confusion_matrix.max() / 2.
-    for i in range(confusion_matrix.shape[0]):
-        for j in range(confusion_matrix.shape[1]):
-            plt.text(j, i, f'{confusion_matrix[i, j]:.2f}', ha="center", va="center",
-                     color="white" if confusion_matrix[i, j] > thresh else "black")
-    plt.ylabel('True Episode Label (0..N-1)')
-    plt.xlabel('Predicted Episode Label (0..N-1)')
-    plt.tight_layout()
-    plt.savefig(f'{prefix}_confusion_matrix.png')
-    print(f"Saved confusion matrix plot to {prefix}_confusion_matrix.png")
-    plt.close()
-
-
-RUN_VISUALIZATION_ONLY = False
-MODEL_LOAD_PATH = 'protonet_best_val_ep200_acc0.7842.pth'
-NUM_VISUALIZATIONS = 15
-
-def main() -> None:
+def main():
     torch.manual_seed(42)
     random.seed(42)
     np.random.seed(42)
-    xbd_root = Path(r"C:\Users\joshp_ya\PycharmProjects\earthquake")
-    patch_sizes = [128, 256]
-    hidden_dim = 64
-    n_way = 4
-    k_shot = 10
-    q_query = 15
+
+    config = {
+        'dataset': {
+            'root_dir': r"C:\Users\joshp_ya\PycharmProjects\earthquake",
+            'patch_size': 64,
+            'max_patches_per_class': 100
+        },
+        'model': {
+            'input_channels': 6,
+            'feature_dim': 64
+        },
+        'training': {
+            'n_way': 3,
+            'k_shot': 5,
+            'q_query': 5,
+            'num_episodes': 100,
+            'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+            'gamma_base': 2.0,
+            'label_smoothing': 0.05,
+            'patience': 2
+        },
+        'evaluation': {
+            'num_episodes': 100,
+            'vis_dir': 'visualizations'
+        }
+    }
+
+    xbd_root = Path(config['dataset']['root_dir'])
+    patch_size = config['dataset']['patch_size']
+    feature_dim = config['model']['feature_dim']
+    n_way = config['training']['n_way']
+    k_shot = config['training']['k_shot']
+    q_query = config['training']['q_query']
     validation_split_ratio = 0.2
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    max_patches_per_class_extraction = 50
+    device = config['training']['device']
+    max_patches_per_class_extraction = config['dataset']['max_patches_per_class']
+    num_episodes = config['training']['num_episodes']
+    gamma_base = config['training']['gamma_base']
+    label_smoothing = config['training']['label_smoothing']
+    patience = config['training']['patience']
 
-    train_transforms = {
-        ps: transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.Resize((ps, ps)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-        ]) for ps in patch_sizes
-    }
-    eval_transforms = {
-        ps: transforms.Compose([
-            transforms.Resize((ps, ps)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-        ]) for ps in patch_sizes
-    }
+    class_counts = {1: 3600, 2: 750, 3: 270, 4: 60}
 
-    train_dataset = None
-    val_dataset = None
-    test_dataset = None
+    train_transforms = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    ])
+    eval_transforms = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    ])
 
-    try:
-        print("\n--- Loading Test Dataset ---")
-        test_dataset = XBDPatchDatasetEnhanced(root_dir=xbd_root, split='test', patch_sizes=patch_sizes,
-                                               transform=eval_transforms, max_patches_per_class=max_patches_per_class_extraction,
-                                               device=device)
-        if test_dataset and len(test_dataset) > 0:
-            print(f"Test dataset loaded with {len(test_dataset)} patches")
-            for label, patches in test_dataset.patches_by_class.items():
-                print(f"  Class {label} ({get_damage_name(label)}): {len(patches)} patches")
-    except Exception as e:
-        print(f"Could not load test set: {e}")
+    logging.info("\n--- Loading Datasets ---")
+    full_train_dataset = XBDPatchDataset(root_dir=xbd_root, split='train', patch_size=patch_size,
+                                         transform=train_transforms, max_patches_per_class=max_patches_per_class_extraction,
+                                         device=device)
+    test_dataset = XBDPatchDataset(root_dir=xbd_root, split='test', patch_size=patch_size,
+                                   transform=eval_transforms, max_patches_per_class=max_patches_per_class_extraction,
+                                   device=device)
 
-    try:
-        print("\n--- Loading Full Training Dataset ---")
-        full_train_dataset = XBDPatchDatasetEnhanced(root_dir=xbd_root, split='train', patch_sizes=patch_sizes,
-                                                     transform=train_transforms, max_patches_per_class=max_patches_per_class_extraction,
-                                                     device=device)
-        if full_train_dataset and len(full_train_dataset) > 0:
-            print(f"Full train dataset loaded with {len(full_train_dataset)} patches")
-            for label, patches in full_train_dataset.patches_by_class.items():
-                print(f"  Class {label} ({get_damage_name(label)}): {len(patches)} patches")
+    logging.info("\n--- Dataset Class Distribution ---")
+    for label in DAMAGE_LABELS.values():
+        logging.info(f"Class {label} ({get_damage_name(label)}): {len(full_train_dataset.metadata_by_class[label])} patches")
 
-        val_dir = xbd_root / 'val'
-        if val_dir.exists():
-            print("\n--- Loading Pre-defined Validation Dataset ---")
-            val_dataset = XBDPatchDatasetEnhanced(root_dir=xbd_root, split='val', patch_sizes=patch_sizes,
-                                                  transform=eval_transforms, max_patches_per_class=max_patches_per_class_extraction,
-                                                  device=device)
-            train_dataset = full_train_dataset
-        else:
-            print("\n--- Creating Validation Split from Training Data ---")
-            train_subset_patches_by_class = {label: [] for label in DAMAGE_LABELS.values()}
-            val_subset_patches_by_class = {label: [] for label in DAMAGE_LABELS.values()}
-            for label, patches in full_train_dataset.patches_by_class.items():
-                if not patches:
-                    continue
-                random.shuffle(patches)
-                split_idx = int(len(patches) * (1.0 - validation_split_ratio))
-                train_subset_patches_by_class[label] = patches[:split_idx]
-                val_subset_patches_by_class[label] = patches[split_idx:]
-            train_subset_patches = [p for label in DAMAGE_LABELS.values() for p in train_subset_patches_by_class[label]]
-            val_subset_patches = [p for label in DAMAGE_LABELS.values() for p in val_subset_patches_by_class[label]]
+    train_subset_patches_by_class = {label: [] for label in DAMAGE_LABELS.values()}
+    val_subset_patches_by_class = {label: [] for label in DAMAGE_LABELS.values()}
+    for label, metadata_list in full_train_dataset.metadata_by_class.items():
+        if not metadata_list:
+            continue
+        random.shuffle(metadata_list)
+        split_idx = int(len(metadata_list) * (1.0 - validation_split_ratio))
+        train_subset_patches_by_class[label].extend(metadata_list[:split_idx])
+        val_subset_patches_by_class[label].extend(metadata_list[split_idx:])
 
-            val_dataset = XBDPatchDatasetEnhanced(root_dir=xbd_root, split='val_from_train', patch_sizes=patch_sizes,
-                                                  transform=eval_transforms, skip_extraction=True,
-                                                  initial_patches=val_subset_patches,
-                                                  initial_patches_by_class=val_subset_patches_by_class, device=device)
-            train_dataset = XBDPatchDatasetEnhanced(root_dir=xbd_root, split='train_subset', patch_sizes=patch_sizes,
-                                                    transform=train_transforms, skip_extraction=True,
-                                                    initial_patches=train_subset_patches,
-                                                    initial_patches_by_class=train_subset_patches_by_class,
-                                                    device=device)
-            print(f"Resulting Train Patches: {len(train_dataset)}")
-            print(f"Resulting Validation Patches: {len(val_dataset)}")
+    train_subset_patches = [patch for label in DAMAGE_LABELS.values() for patch in train_subset_patches_by_class[label]]
+    val_subset_patches = [patch for label in DAMAGE_LABELS.values() for patch in val_subset_patches_by_class[label]]
 
-    except FileNotFoundError as e:
-        print(f"Fatal Error: Could not load necessary dataset files: {e}")
-        return
-    except Exception as e:
-        print(f"Fatal Error during dataset loading: {e}")
-        return
+    train_dataset = XBDPatchDataset(root_dir=xbd_root, split='train_subset', patch_size=patch_size,
+                                    transform=train_transforms, skip_extraction=True,
+                                    initial_patches=train_subset_patches,
+                                    initial_patches_by_class=train_subset_patches_by_class, device=device)
+    val_dataset = XBDPatchDataset(root_dir=xbd_root, split='val_from_train', patch_size=patch_size,
+                                  transform=eval_transforms, skip_extraction=True,
+                                  initial_patches=val_subset_patches,
+                                  initial_patches_by_class=val_subset_patches_by_class, device=device)
 
-    if RUN_VISUALIZATION_ONLY and (not test_dataset or len(test_dataset) == 0):
-        print("Warning: No test dataset loaded. Visualization might fail if 'vis_dataset' cannot be set.")
-    if RUN_VISUALIZATION_ONLY and (not full_train_dataset or len(full_train_dataset) == 0):
-        print("Fatal: Full training dataset needed for support set in visualization mode, but failed to load. Exiting.")
-        return
-
-    print("\n--- Initializing Model ---")
-    model = ProtoNetEnhanced(input_channels=6, hidden_dim=64, num_scales=len(patch_sizes), dropout_rate=0.3)
+    logging.info("\n--- Initializing Model ---")
+    model = ProtoNet(input_channels=config['model']['input_channels'], feature_dim=feature_dim).to(device)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Created ProtoNetEnhanced model with {model_params:,} trainable parameters")
+    logging.info(f"Created ProtoNet with SE-enhanced CNN backbone, {model_params:,} trainable parameters")
 
-    if not RUN_VISUALIZATION_ONLY and train_dataset and val_dataset:
-        print("\n--- Training Model ---")
-        model = train_protonet_with_patches(
-            model=model,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            n_way=n_way,
-            k_shot=k_shot,
-            q_query=q_query,
-            num_episodes=200,
-            device=device,
-            val_interval=100,
-            early_stopping_patience=3
-        )
-        print("\n--- Training Completed ---")
-    print("\n--- Final Evaluation on Test Set ---")
-    if test_dataset and len(test_dataset) > 0:
-        test_results = evaluate_model(model, test_dataset, num_episodes=100, n_way=n_way, k_shot=k_shot,
-                                      q_query=q_query, device=device, eval_mode='test')
-        visualize_results(test_results, prefix="test")
-    else:
-        print("Skipping test set evaluation: Test dataset not available.")
-
-    print(f"\n--- Loading model for visualization from: {MODEL_LOAD_PATH} ---")
-    if 'full_train_dataset' not in locals() or not full_train_dataset:
-        print("Error: Full training dataset required for support set but not loaded. Cannot visualize.")
-        return
-
-    model_to_visualize = load_trained_model(ProtoNetEnhanced, MODEL_LOAD_PATH, input_channels=6, hidden_dim=64, device=device, num_scales=len(patch_sizes))
-    train_data_for_vis_support = full_train_dataset
-
-    print("\n--- Preparing for Visualization ---")
-    if model_to_visualize is not None:
-        vis_target_dataset = None
-        if test_dataset and len(test_dataset) > 0:
-            print("Using Test dataset for visualization.")
-            vis_target_dataset = test_dataset
-        elif val_dataset and len(val_dataset) > 0:
-            print("Using Validation dataset for visualization (Test dataset not available/loaded).")
-            vis_target_dataset = val_dataset
+    checkpoint_path = 'trained_model.pth'
+    if os.path.exists(checkpoint_path):
+        logging.info(f"\n--- Found Checkpoint at {checkpoint_path} ---")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            best_val_acc = checkpoint.get('best_val_acc', -1.0)
+            last_episode = checkpoint.get('episode', 0)
+            logging.info(f"Checkpoint Details: Best Validation Accuracy = {best_val_acc:.4f}, Last Episode = {last_episode}")
         else:
-            print("Warning: No Test or Validation dataset available to visualize predictions from.")
-
-        if train_data_for_vis_support is not None and vis_target_dataset:
-            visualize_predictions(
-                model=model_to_visualize,
-                vis_dataset=vis_target_dataset,
-                train_dataset=train_data_for_vis_support,
-                k_shot=k_shot,
-                num_samples=NUM_VISUALIZATIONS,
-                device=device
-            )
+            model.load_state_dict(checkpoint)
+            logging.info("Loaded legacy checkpoint (no metadata available).")
+            best_val_acc = -1.0
+            last_episode = 0
+        model = model.to(device)
+        retrain = input("Checkpoint exists. Retrain from scratch? (yes/no, default=no): ").lower() == 'yes'
+        if retrain:
+            logging.info("\n--- Retraining Model from Scratch ---")
+            model = train_protonet_with_patches(model, train_dataset, val_dataset, n_way, k_shot, q_query,
+                                                num_episodes=num_episodes, device=device, class_counts=class_counts,
+                                                gamma_base=gamma_base, label_smoothing=label_smoothing, patience=patience, config=config)
+            logging.info(f"\n--- Saved Retrained Model to {checkpoint_path} ---")
         else:
-            print("Skipping visualization as training data or target dataset is not available.")
+            logging.info("\n--- Skipping Training, Using Existing Checkpoint ---")
     else:
-        print("Skipping visualization as no model was loaded successfully.")
+        logging.info("\n--- No Checkpoint Found, Training Model ---")
+        model = train_protonet_with_patches(model, train_dataset, val_dataset, n_way, k_shot, q_query,
+                                            num_episodes=num_episodes, device=device, class_counts=class_counts,
+                                            gamma_base=gamma_base, label_smoothing=label_smoothing, patience=patience, config=config)
+        logging.info(f"\n--- Saved Trained Model to {checkpoint_path} ---")
 
-    print("\n--- Script Finished ---")
+    logging.info("\n--- Final Evaluation on Test Set ---")
+    test_class_counts = {label: len(test_dataset.metadata_by_class[label]) for label in DAMAGE_LABELS.values()}
+    logging.info(f"Natural test class distribution: {test_class_counts}")
+    ablation_results = run_ablation_study(model, test_dataset, num_episodes=config['evaluation']['num_episodes'],
+                                          n_way=n_way, k_shot=k_shot, q_query=q_query, device=device,
+                                          class_counts=test_class_counts, vis_dir=config['evaluation']['vis_dir'])
+    test_results = ablation_results['se_results']
+    baseline_results = ablation_results['baseline_results']
+
+    logging.info("\n--- SE-Enhanced ProtoNet Results ---")
+    logging.info(f"Test Overall Accuracy: {test_results['overall_accuracy']:.4f}")
+    logging.info(f"95% CI for Accuracy: {test_results['accuracy_ci']}")
+    logging.info(f"Average Inference Time per Episode: {test_results['avg_inference_time']:.4f} seconds")
+    logging.info(f"Macro Precision: {test_results['macro_precision']:.4f}")
+    logging.info(f"Macro Recall: {test_results['macro_recall']:.4f}")
+    logging.info(f"Macro F1 Score: {test_results['macro_f1']:.4f}")
+    logging.info(f"Average Heatmap Variance: {test_results['heatmap_variance']:.4f}")
+    logging.info("\nPer-Class Metrics:")
+    for label, metrics in test_results['class_metrics'].items():
+        logging.info(f"Class {label} ({get_damage_name(label)}):")
+        logging.info(f"  Accuracy: {metrics['accuracy']:.4f}")
+        logging.info(f"  Precision: {metrics['precision']:.4f}")
+        logging.info(f"  Recall: {metrics['recall']:.4f}")
+        logging.info(f"  F1 Score: {metrics['f1']:.4f}")
+        logging.info(f"  Support: {metrics['support']}")
+        logging.info(f"  Prototype Distance (Mean ± Std): {test_results['prototype_distances'][label]['mean']:.4f} ± "
+                     f"{test_results['prototype_distances'][label]['std']:.4f}")
+    logging.info("\nConfusion Matrix:")
+    logging.info("(Rows: True Labels, Columns: Predicted Labels)")
+    logging.info("Classes: [No Damage, Minor Damage, Major Damage, Destroyed]")
+    logging.info(np.array(test_results['confusion_matrix']))
+    logging.info("\nClass Frequencies: " + str(test_results['class_frequencies']))
+
+    logging.info("\n--- Baseline ProtoNet Results (No SE Blocks) ---")
+    logging.info(f"Test Overall Accuracy: {baseline_results['overall_accuracy']:.4f}")
+    logging.info(f"Average Inference Time per Episode: {baseline_results['avg_inference_time']:.4f} seconds")
+    logging.info(f"Macro F1 Score: {baseline_results['macro_f1']:.4f}")
 
 if __name__ == "__main__":
     main()
